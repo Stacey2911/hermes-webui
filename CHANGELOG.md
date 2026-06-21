@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Transparent Stream keeps its full tool / thinking / progress-prose activity after reload, tab/focus changes, and session re-entry (#4568).** A turn that settled with the stable assistant-turn anchor scene (`activity_scene_v1`) could lose its Transparent Stream activity rows on a hard refresh, when switching away and back, on tab hide/show or window blur/focus, and on a mid-stream reload — leaving only the final answer. The legacy Transparent Stream rebuild correctly skipped anchor-owned turns, but only Compact Worklog had a settled anchor-scene renderer, so in Transparent Stream the rows rendered nowhere. Transparent Stream now renders the persisted anchor activity rows directly: tool cards and thinking rows are restored, and the intermediate between-tool progress prose is kept interleaved in chronological order (only the prose row that duplicates the final answer — already owned by the assistant message segment — is suppressed). Verified across the live → settled → switch-away → tab-hidden → blur → reload → mid-stream-reload checkpoint matrix in both display modes. Thanks @franksong2702 for the persisted-anchor-scene rendering approach.
+
 ## [v0.51.548] — 2026-06-21 — Release TG (extension load diagnostics)
 
 ### Added
