@@ -18,7 +18,9 @@ def test_fenced_code_blocks_keep_existing_pre_header_layout():
     js = _read_ui_js()
     # The fenced code rendering was moved into the stash callback (#1154 fix).
     # The template string now uses `lang` instead of `normalizedLang`.
-    assert '${h}<pre><code${langAttr}>${esc(code.replace(/\\n$/,' in js, (
+    # #4669 added an optional `${preClass}` on the <pre> (only set for md/markdown/mdx
+    # source previews); the underlying <pre><code${langAttr}> layout is unchanged.
+    assert '${h}<pre${preClass}><code${langAttr}>${esc(code.replace(/\\n$/,' in js, (
         "The syntax-highlight fix should preserve the existing fenced code block layout"
     )
     assert '<div class="code-block">' not in js, (

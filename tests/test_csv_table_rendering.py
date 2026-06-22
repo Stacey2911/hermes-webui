@@ -41,7 +41,9 @@ def test_csv_fence_fallback_for_insufficient_rows():
         src = f.read()
     fence_section = src[src.find("lang==='csv'"):src.find("lang==='csv'") + 800]
     assert 'rows.length>=2' in fence_section, "Should check for at least 2 rows"
-    assert '<pre><code' in fence_section, "Fallback should render as <pre><code>"
+    # #4669 added an optional ${preClass} on the <pre> (md/markdown/mdx only); the
+    # CSV-insufficient-rows fallback still renders as <pre...><code>.
+    assert '<pre${preClass}><code' in fence_section, "Fallback should render as <pre><code>"
 
 
 def test_csv_media_file_handler():

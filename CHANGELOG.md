@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Markdown source previews now wrap normal prose instead of forcing horizontal scroll.** Fenced code blocks tagged `md`, `markdown`, or `mdx` (the inline viewer with the small `MD` header and Copy button) now render in a dedicated wrapping source-preview style, so ordinary markdown text flows to the message width while true code/diff blocks keep their existing horizontal-scroll behavior. Thanks @TomBanksAU. (#4669)
+
 ## [v0.51.578] — 2026-06-22 — Release UK (preserve reader scroll position across re-render)
 
 ### Fixed
