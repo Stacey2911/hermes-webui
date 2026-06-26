@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **A command-approval card whose stream already ended no longer dead-ends on "Approval response not accepted." with a stuck card.** On the default local in-process backend, if a guarded-command approval card was still on screen when its turn ended (user cancel, fork, provider error, or completion while the card was pending), the agent's queue entry was dropped and the mirrored pending state was reconciled away. Clicking Approve/Deny then sent an `approval_id` that no longer matched anything, so the server returned a bare `{ok: false}` and — since #4771 began surfacing response failures — the UI showed "Approval response not accepted." and left the orphan card stuck. The server now distinguishes a genuinely stale card (nothing pending for the session → benign `{ok: true, stale_cleared: true}` so the UI clears the orphan) from a stale-id click made while a *different* approval is still live (still rejected, so it can never resolve the wrong command — the #527 guard is preserved). The frontend clears the orphan card on `stale_cleared` even if the displayed id has drifted. Reported by @santastabber and b3nw. (#4948 local-backend variant, #4771 follow-up)
+
 ## [v0.51.668] — 2026-06-26 — Release XX (WebUI stays in sync after the Desktop app continues a session)
 
 ### Fixed
