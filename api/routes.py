@@ -235,6 +235,7 @@ except Exception:
 # Track job IDs currently being executed so the frontend can poll status.
 _RUNNING_CRON_JOBS: dict[str, float] = {}  # job_id → start_timestamp
 _RUNNING_CRON_LOCK = threading.Lock()
+_CRON_CREATE_SNAPSHOT_LOCK = threading.Lock()
 _MANUAL_COMPRESSION_JOBS: dict[str, dict] = {}
 _MANUAL_COMPRESSION_JOBS_LOCK = threading.Lock()
 _MANUAL_COMPRESSION_JOB_TTL_SECONDS = 10 * 60
@@ -18256,17 +18257,18 @@ def _selected_profile_snapshot_updates(
         return {}
 
     try:
-        with profile_env_for_background_worker(
-            selected_profile,
-            "cron create snapshot",
-            logger_override=logger,
-        ):
-            provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
-                provider=provider,
-                model=model,
-                base_url=None,
-                no_agent=False,
-            )
+        with _CRON_CREATE_SNAPSHOT_LOCK:
+            with profile_env_for_background_worker(
+                selected_profile,
+                "cron create snapshot",
+                logger_override=logger,
+            ):
+                provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
+                    provider=provider,
+                    model=model,
+                    base_url=None,
+                    no_agent=False,
+                )
     except Exception:
         logger.warning(
             "Selected-profile cron snapshot repair failed for %s; saving ambient snapshots",

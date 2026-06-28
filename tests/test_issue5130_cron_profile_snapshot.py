@@ -451,3 +451,49 @@ def test_selected_profile_snapshot_helper_never_repoints_cron_store_globals(monk
             original_paths[2],
         ),
     ]
+
+
+def test_selected_profile_snapshot_helper_holds_lock_across_profile_env_and_compute(monkeypatch):
+    import api.profiles as profiles
+    import api.routes as routes
+
+    events = []
+    cron_jobs = types.ModuleType("cron.jobs")
+
+    class RecorderLock:
+        def __enter__(self):
+            events.append("lock-enter")
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("lock-exit")
+
+    def compute_snapshots(*, provider, model, base_url, no_agent):
+        events.append(("compute", provider, model, base_url, no_agent))
+        return "openai-codex", "gpt-5.4"
+
+    @contextmanager
+    def fake_profile_env(profile, purpose, logger_override=None):
+        events.append(("profile-enter", profile, purpose, logger_override is routes.logger))
+        yield
+        events.append(("profile-exit", profile, purpose))
+
+    cron_jobs._compute_provider_model_snapshots = compute_snapshots
+
+    monkeypatch.setattr(routes, "_CRON_CREATE_SNAPSHOT_LOCK", RecorderLock())
+    monkeypatch.setattr(profiles, "profile_env_for_background_worker", fake_profile_env)
+    _install_fake_cron_modules(monkeypatch, cron_jobs)
+
+    updates = routes._selected_profile_snapshot_updates(
+        "research",
+        provider=None,
+        model="gpt-5.4",
+    )
+
+    assert updates == {"provider_snapshot": "openai-codex"}
+    assert events == [
+        "lock-enter",
+        ("profile-enter", "research", "cron create snapshot", True),
+        ("compute", None, "gpt-5.4", None, False),
+        ("profile-exit", "research", "cron create snapshot"),
+        "lock-exit",
+    ]
