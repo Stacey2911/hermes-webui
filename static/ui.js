@@ -10501,24 +10501,33 @@ function _renderSettledAnchorSceneTransparentForMessage(message, segment, rawIdx
 // renderMessages({preserveScroll:true}) call and cleared after the settled-scene
 // render pass; null at all other times.
 let _keepSettledWorklogOpenForStreamId=null;
-function _shouldKeepSettledWorklogOpenForPinnedFollow(streamId){
-  // Round 6 scroll-jump guard: while the reader is pinned at the live tail,
-  // collapsing the JUST-settled live worklog into a compact summary can shrink
-  // the transcript by hundreds of px at STREAM_DONE. The browser clamps scrollTop
-  // to the new max, which looks like a large backward jump even though pinned
-  // state is correct. Keep that one worklog open for pinned followers so the
-  // live->settled DOM swap is height-stable; unpinned readers still get compact
-  // settled worklogs and preserve their viewport normally. This intentionally
-  // wins over a transient user-collapsed live worklog while the reader remains
-  // pinned: avoiding the visible STREAM_DONE jump takes precedence for followers.
+function _shouldKeepSettledWorklogOpenForStreamSettle(streamId){
+  // Round 6 scroll-jump guard: collapsing the JUST-settled live worklog into a
+  // compact summary at STREAM_DONE shrinks the transcript by hundreds of px. The
+  // resulting backward jump hits readers in TWO positions, so keep that one
+  // worklog open for BOTH on the settle render — the live->settled DOM swap is
+  // then height-stable and there is no shrink for any scroll path to mishandle:
+  //
+  //  1. PINNED follower at the live tail: the shrink lowers scrollHeight, the
+  //     browser clamps scrollTop to the new max, and the viewport snaps upward
+  //     even though pin state is correct.
+  //  2. UNPINNED reader who scrolled UP to read inside the just-settled turn
+  //     (the mobile "往回大跳" report, #MOBILESCROLL follow-up): the worklog sits
+  //     ABOVE their viewport, so collapsing it pulls their content up to the top
+  //     of the turn. On desktop overflow-anchor:none + the JS snapshot restore
+  //     keep them put, but on mobile the CSS resting value is overflow-anchor:
+  //     auto AND _fixMobileScrollJank() flips an inline overflow-anchor:none over
+  //     the settle render — which is exactly the wrong state: native anchoring is
+  //     suppressed during the one frame the unpinned reader needs it to absorb
+  //     the above-viewport shrink, so the content leaps to the turn's top. Keeping
+  //     the worklog open removes the shrink entirely, which fixes it for every
+  //     device/anchor-mode combination instead of fighting the anchor engine.
+  //
   // SCOPING: the exception is gated on the one-shot token matching this turn's
   // stream id, so it applies ONLY to the turn that just settled — not to every
-  // historical settled worklog on every pinned re-render (which would defeat the
-  // compact-worklog default for past turns). Pin flags use the sticky pin state
-  // because during live DOM rebuilds the raw bottom distance can transiently
-  // exceed a threshold even for a pinned follower.
-  if(!streamId||_keepSettledWorklogOpenForStreamId!==streamId) return false;
-  return !!(_scrollPinned && !_messageUserUnpinned);
+  // historical settled worklog on every re-render (which would defeat the
+  // compact-worklog default for past turns).
+  return !!(streamId&&_keepSettledWorklogOpenForStreamId===streamId);
 }
 // One-shot token set/clear API used by the STREAM_DONE handler (messages.js):
 // arm the keep-open exception for exactly the turn that just settled, render,
@@ -10528,6 +10537,15 @@ function _armKeepSettledWorklogOpen(streamId){
 }
 function _disarmKeepSettledWorklogOpen(){
   _keepSettledWorklogOpenForStreamId=null;
+}
+// True while a just-settled worklog is being force-rendered open (between
+// _armKeepSettledWorklogOpen and _disarmKeepSettledWorklogOpen). renderMessages()
+// consults this so it does NOT write the forced-open DOM into _sessionHtmlCache:
+// the keep-open is a transient settle-frame device, and caching it would persist
+// the forced-open worklog across session switches / restores, silently overriding
+// a user-collapsed worklog. (#5260 gate-cert: keep-open must not leak into cache.)
+function _isKeepSettledWorklogOpenArmed(){
+  return _keepSettledWorklogOpenForStreamId!==null;
 }
 if(typeof window!=='undefined'){
   window._armKeepSettledWorklogOpen=_armKeepSettledWorklogOpen;
@@ -10555,11 +10573,20 @@ function _renderSettledAnchorSceneForMessage(message, segment, rawIdx){
   });
   blocks.querySelectorAll('.tool-worklog-group:not([data-anchor-scene-owner="1"]),.tool-call-group:not([data-anchor-scene-owner="1"]),.agent-activity-thinking:not([data-anchor-scene-row="1"]),.wl-reason').forEach(el=>el.remove());
   const streamId=String(message._anchor_stream_id||scene.stream_id||scene.identity&&scene.identity.stream_id||'');
-  const keepSettledWorklogOpen=_shouldKeepSettledWorklogOpenForPinnedFollow(streamId);
+  const keepSettledWorklogOpen=_shouldKeepSettledWorklogOpenForStreamSettle(streamId);
   const activityKey=`anchor-scene:${rawIdx}`;
   if(streamId&&!_readActivityDisclosureState(activityKey)){
     _copyActivityDisclosureState(`live:${streamId}`, activityKey);
   }
+  // keepSettledWorklogOpen forces collapsed:false for the ONE height-stable settle
+  // render of the just-settled turn (no STREAM_DONE shrink jump) for both pinned
+  // followers AND unpinned mid-turn readers. The keep-open is made genuinely
+  // transient by the STREAM_DONE handler (messages.js): right after this render it
+  // disarms the token and runs a scroll-PRESERVING collapse pass, so a worklog the
+  // reader had manually collapsed returns to its copied disclosure state
+  // (_copyActivityDisclosureState above) without the jump. While the token is
+  // armed this forced-open DOM is also kept OUT of _sessionHtmlCache
+  // (_isKeepSettledWorklogOpenArmed), so it never persists across restores.
   const group=_anchorSceneWorklogGroup(blocks,{
     live:false,
     collapsed:!keepSettledWorklogOpen,
@@ -13436,7 +13463,15 @@ function renderMessages(options){
   if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(inner);
   // Populate session cache so switching back here skips a full rebuild.
   _sessionHtmlCacheSid=sid;
-  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi){
+  // Skip caching while the just-settled keep-open token is armed: that render
+  // force-opens the settled worklog for height-stability, and caching it would
+  // persist the forced-open DOM across session switches / restores, overriding a
+  // user-collapsed worklog. The follow-up collapse pass (after disarm) produces
+  // the correct cacheable DOM on its own render. (#5260 gate-cert.) The typeof
+  // guard keeps standalone renderMessages() test harnesses (which don't define
+  // the helper) working — absent helper == not armed == cache normally.
+  const _keepOpenArmed=(typeof _isKeepSettledWorklogOpenArmed==='function')&&_isKeepSettledWorklogOpenArmed();
+  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!_keepOpenArmed){
     const _html=inner.innerHTML;
     // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
     if(_html.length<300_000){
