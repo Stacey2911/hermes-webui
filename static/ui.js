@@ -9529,8 +9529,21 @@ function _transparentToolSummary(tc){
   if(target) return target;
   return '';
 }
-function _copyEventToClipboard(row){
+function _copyEventToClipboard(row, btn){
   if(!row) return;
+  const showCopiedFeedback=()=>{
+    if(!btn) return;
+    if(btn._transparentCopyResetTimer) clearTimeout(btn._transparentCopyResetTimer);
+    if(btn._transparentCopyOriginalHtml===undefined) btn._transparentCopyOriginalHtml=btn.innerHTML;
+    btn.innerHTML=(typeof li==='function')?li('check',11):(t('copied')||'Copied');
+    btn.style.color='var(--blue)';
+    btn._transparentCopyResetTimer=setTimeout(()=>{
+      btn.innerHTML=btn._transparentCopyOriginalHtml;
+      btn.style.color='';
+      btn._transparentCopyOriginalHtml=undefined;
+      btn._transparentCopyResetTimer=null;
+    },1500);
+  };
   const type=row.getAttribute('data-event-type');
   let text='';
   let label='event';
@@ -9583,6 +9596,7 @@ function _copyEventToClipboard(row){
       ta.select();
       const ok=document.execCommand('copy');
       document.body.removeChild(ta);
+      if(ok) showCopiedFeedback();
       if(typeof showToast==='function') showToast(ok?(t('copied')||'Copied'):(t('copy_failed')||'Copy failed'),1600);
     }catch(_){
       if(typeof showToast==='function') showToast(t('copy_failed')||'Copy failed',2000,'error');
@@ -9590,6 +9604,7 @@ function _copyEventToClipboard(row){
   };
   if(navigator&&navigator.clipboard&&navigator.clipboard.writeText){
     navigator.clipboard.writeText(text).then(()=>{
+      showCopiedFeedback();
       if(typeof showToast==='function') showToast(`${t('copied')||'Copied'} ${label}`,1600);
     }).catch(fallback);
   }else{
@@ -9609,7 +9624,7 @@ function _attachCopyButton(header){
     const handler=function(ev){
       ev.stopPropagation();
       ev.preventDefault();
-      _copyEventToClipboard(header.closest('.transparent-event-row'));
+      _copyEventToClipboard(header.closest('.transparent-event-row'), btn);
     };
     btn.onclick=handler;
     btn.onkeydown=function(ev){
@@ -9763,6 +9778,45 @@ function _syncTransparentEventControls(turn){
   // from the settled render loop). (Trifecta r2 follow-up.)
   _applyTransparentRowFading(turn);
 }
+let _transparentMessageActionDismissBound=false;
+function _ensureTransparentMessageActionDismiss(){
+  if(_transparentMessageActionDismissBound||typeof document==='undefined') return;
+  _transparentMessageActionDismissBound=true;
+  document.addEventListener('click',ev=>{
+    if(!isTransparentStream()) return;
+    const target=ev&&ev.target;
+    if(target&&target.closest&&target.closest('.assistant-turn[data-transparent-msg-actions-open="1"]')) return;
+    document.querySelectorAll('.assistant-turn[data-transparent-msg-actions-open="1"]').forEach(turn=>{
+      turn.removeAttribute('data-transparent-msg-actions-open');
+    });
+  });
+}
+function _wireTransparentMessageActionReveal(root){
+  if(!root||!isTransparentStream()) return;
+  const turns=[];
+  if(root.matches&&root.matches('.assistant-turn')) turns.push(root);
+  root.querySelectorAll('.assistant-turn').forEach(turn=>turns.push(turn));
+  if(!turns.length) return;
+  _ensureTransparentMessageActionDismiss();
+  turns.forEach(turn=>{
+    if(turn.id==='liveAssistantTurn') return;
+    if(turn.getAttribute('data-transparent-message-action-reveal-bound')==='1') return;
+    turn.setAttribute('data-transparent-message-action-reveal-bound','1');
+    turn.addEventListener('click',ev=>{
+      const target=ev&&ev.target;
+      if(!target||!target.closest) return;
+      if(target.closest('.msg-action-btn,.msg-foot,.transparent-event-row,.transparent-turn-footer,.msg-role.assistant')) return;
+      const segment=target.closest('.assistant-segment');
+      if(!segment||!turn.contains(segment)) return;
+      if(!turn.querySelector('.msg-foot .msg-copy-btn')) return;
+      const scope=turn.closest('#msgInner')||document;
+      scope.querySelectorAll('.assistant-turn[data-transparent-msg-actions-open="1"]').forEach(other=>{
+        if(other!==turn) other.removeAttribute('data-transparent-msg-actions-open');
+      });
+      turn.setAttribute('data-transparent-msg-actions-open','1');
+    });
+  });
+}
 function _rehydrateTransparentStreamDom(root){
   if(!root||!isTransparentStream()) return;
   // Handle BOTH a container root and a root that IS itself an assistant turn
@@ -9775,6 +9829,7 @@ function _rehydrateTransparentStreamDom(root){
     _wireTransparentTurnToggle(turn);
     _syncTransparentEventControls(turn);
   });
+  _wireTransparentMessageActionReveal(root);
   root.querySelectorAll('.transparent-event-row').forEach(row=>{
     const card=row.querySelector('.tool-card,.thinking-card');
     const header=row.querySelector('.tool-card-header,.thinking-card-header');
@@ -14117,6 +14172,7 @@ function renderMessages(options){
         _renderTransparentTurnFooter(turn,{});
       }
     }
+    _wireTransparentMessageActionReveal(inner);
   }
   // Fail-safe invariant (#3875): a settled assistant turn must never render with
   // ZERO visible content. The Worklog redesign (#3401) folds intermediate
