@@ -200,7 +200,10 @@ def test_attach_live_stream_registers_one_source_per_session_stream():
     error_body = _event_body("error")
 
     assert "const LIVE_STREAMS={};" in MESSAGES_JS
-    assert "LIVE_STREAMS[activeSid]={streamId,source};" in wire_body
+    registration = _brace_body_after(wire_body, "LIVE_STREAMS[activeSid]=")
+    assert "streamId,source" in registration
+    assert "flushScene:" in registration
+    assert "disposeScene:" in registration
     assert "existingLive.source.close();" in wire_body
     assert "if(source&&live.source!==source) return;" in close_body
     assert "existingLive&&existingLive.streamId===streamId" in attach_body

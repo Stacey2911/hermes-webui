@@ -466,7 +466,7 @@ global._firstValidTimestampSeconds=()=>null;
 eval(anchorsSrc);
 for(const name of [
   'chatActivityMode','isTransparentStream','isFinalAnswerOnlyMode','isCompactWorklogMode','isSimplifiedToolCalling',
-  '_anchorSceneIsSettledSuccessfulCompression','_anchorSceneRowsForRendering',
+  '_anchorSceneIsSettledSuccessfulCompression','_anchorSceneSourceRows','_anchorSceneRowsForRendering',
   '_anchorSceneRowTimestampSeconds','_anchorSceneTransparentNodeForRow',
   '_transparentLiveRowKey','_transparentLiveRowsCompatible',
   '_transparentLiveRowAttributePairs','_transparentLiveRowInteractiveState',
@@ -474,7 +474,8 @@ for(const name of [
   '_thinkingMarkup','_renderThinkingInto',
   '_resetMismatchedLiveAssistantTurnForSession',
   '_liveAnchorReasoningRowForFallback','_updateLiveAnchorReasoningRowForFallback',
-  '_anchorSceneNodeForRow','_anchorSceneWorklogGroup','_renderAnchorSceneRowsIntoWorklog',
+  '_anchorSceneNodeForRow','_anchorSceneWorklogGroup','_anchorSceneWorklogState',
+  '_anchorSceneWorklogRowKey','_anchorSceneWorklogAppendRow','_renderAnchorSceneRowsIntoWorklog',
   'isLiveAnchorActivitySceneOwner','_projectLiveAnchorActivitySceneForStream',
   '_restoreLiveAnchorScrollSnapshotAfterRebuild',
   '_renderLiveAnchorActivitySceneTransparent','renderLiveAnchorActivityScene',
