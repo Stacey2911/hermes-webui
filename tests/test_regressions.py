@@ -1065,8 +1065,11 @@ def test_messages_js_live_assistant_segment_reuses_live_turn_wrapper(cleanup_tes
     compact_token_body = token_body.replace(" ", "").replace("\n", "")
     assert "if(assistantRow){ensureAssistantRow();_scheduleRender();}" in compact_token_body, \
         "token handler should skip the per-token full-text parse after the live answer segment exists"
-    assert "constparsed=_parseStreamState();if(String((parsed&&parsed.displayText)||'').trim())ensureAssistantRow();_scheduleRender(parsed);" in compact_token_body, \
-        "token handler must only create the live answer segment once visible answer text starts"
+    assert "_scheduleSemanticProse();" in compact_token_body
+    assert "_parseStreamState()" not in compact_token_body
+    semantic_body = src[src.index("function _drainSemanticProse("):src.index("function _scheduleSemanticProse(")]
+    assert "if(String(parsed.displayText||'').trim()) ensureAssistantRow();" in semantic_body, \
+        "semantic batch must only create the live answer segment once visible answer text starts"
 
 
 def test_messages_js_stream_perf_cleanup_lifecycle(cleanup_test_sessions):

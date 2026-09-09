@@ -13037,6 +13037,16 @@ function _appendWorklogStep(group, anchor, cards, thinkingText, opts){
   }
 }
 const _anchorSceneRenderProjectionCaches=new Map();
+function _releaseAnchorSceneRenderProjections(sessionId,streamId){
+  let released=0;
+  for(const [key,state] of _anchorSceneRenderProjectionCaches){
+    if(state.sessionId===String(sessionId||'')&&state.streamId===String(streamId||'')){
+      _anchorSceneRenderProjectionCaches.delete(key);
+      released++;
+    }
+  }
+  return released;
+}
 function _anchorSceneRenderCacheKey(scene, settled){
   const identity=scene&&scene.identity&&typeof scene.identity==='object'?scene.identity:{};
   const values=[
@@ -13047,8 +13057,14 @@ function _anchorSceneRenderCacheKey(scene, settled){
     identity.local_id,
     Array.isArray(identity.source_message_refs)?identity.source_message_refs:[],
   ];
-  if(!values.slice(0,5).some((value)=>String(value||'').trim())) return '';
-  return `${settled?'settled':'live'}:${JSON.stringify(values)}`;
+  if(settled){
+    _anchorSceneRenderProjectionCaches.delete(_anchorSceneRenderCacheKey(scene,false));
+    return '';
+  }
+  // Without a stream/session owner there is no lifecycle that can release it.
+  if(!String(identity.session_id||'').trim()||!String(identity.stream_id||'').trim()||
+      !String(identity.turn_id||identity.local_id||'').trim()) return '';
+  return `live:${JSON.stringify(values)}`;
 }
 function _anchorSceneRenderOutputKey(row){
   if(!row||typeof row!=='object') return '';
@@ -13160,6 +13176,9 @@ function _anchorSceneRememberFullProjection(scene, opts, rows){
   const cacheKey=_anchorSceneRenderCacheKey(scene,settled);
   if(!cacheKey) return;
   const state={
+    sessionId:String(scene.identity?.session_id||''),
+    streamId:String(scene.identity?.stream_id||''),
+    turnId:String(scene.identity?.turn_id||scene.identity?.local_id||''),
     mode:String(scene.mode||''),
     settled,
     revision:projection.revision,

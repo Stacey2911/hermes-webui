@@ -297,6 +297,10 @@ def test_actual_sse_registration_rejects_obsolete_callbacks_before_handlers():
 let _anchorPaintGeneration=0,_anchorPaintDisposed=false,_anchorPaintScheduler=null;
 let _pendingProsePaint=null,_committingLivePaint=false,_deferAnchorScenePaint=false,_pendingKatexPaint=false,_persistTimer=null; const _pendingMediaPaintRoots=new Set();
 const activeSid='a',streamId='s',LIVE_STREAMS={};
+const INFLIGHT={};
+const _resumeSessionStreamAfterLiveChat=()=>{};
+const _drainSemanticProse=()=>{},_scheduleSemanticProse=()=>{};
+eval(extract(messageSource,'closeLiveStream'));
 let _terminalStateReached=false,_streamFinalized=false,assistantText='',mirrors=0;
 const S={session:{session_id:'background-pane'},activeStreamId:'other'};
 const syncInflightAssistantMessage=()=>mirrors++;
@@ -336,7 +340,7 @@ for(const c of old.callbacks)c.fn({data:'{}',lastEventId:'s:999'});
 assert.equal(mirrors,0);
 fresh.dispatch('token',{text:'new generation'});
 assert.equal(assistantText,'new generation');
-assert.equal(mirrors,2,'new token ingestion and cursor listener both execute');
+assert.equal(mirrors,1,'cursor executes; inflight extraction waits for the semantic batch');
 """)
 
 

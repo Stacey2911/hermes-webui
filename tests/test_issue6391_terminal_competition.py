@@ -6,7 +6,7 @@ def test_registered_callbacks_cannot_override_claimed_terminal():
 let _anchorPaintGeneration=0,_anchorPaintDisposed=false,_anchorPaintScheduler=null;
 const LIVE_STREAMS={},activeSid='s',streamId='r';
 let _terminalStateReached=true,_streamFinalized=true,finished=0,closed=0;
-const _completeOwnedTerminal=()=>finished++,_closeSource=()=>closed++;
+const _completeOwnedTerminal=()=>{finished++;_pendingTerminalFinish=null;},_closeSource=()=>closed++;
 let _deferAnchorScenePaint=false;
 const _rememberRunJournalCursor=()=>{throw new Error('late cursor callback');};
 eval(extract(messageSource,'_withDeferredAnchorScenePaint'));
@@ -18,8 +18,9 @@ for(const type of ['token','reasoning','interim_assistant','tool','tool_complete
  for(const c of listeners.filter(c=>c.type===type))c.fn({data:'invalid JSON'});
 }
 assert.equal(finished,0);
+_pendingTerminalFinish={generation:0,finish:()=>{}};
 for(const c of listeners.filter(c=>c.type==='error'))c.fn({data:'invalid JSON'});
-assert.ok(finished>=1);assert.ok(closed>=1);
+assert.equal(finished,1);assert.equal(closed,1);
 """)
 
 

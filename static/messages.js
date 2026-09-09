@@ -2049,9 +2049,7 @@ function _shouldForceCompletionNotification(sid, streamId){
 
 function _disposeLiveScenePaints(){
   for(const [sessionId,live] of Object.entries(LIVE_STREAMS)){
-    // Page teardown is not supersession: complete an already received terminal
-    // result before detaching, otherwise use the existing reattach handoff.
-    if(typeof live?.finishScene==='function') live.finishScene();
+    // All detach paths share the current owner's terminal-first contract.
     if(typeof closeLiveStream==='function') closeLiveStream(sessionId,live.streamId,live.source);
     else if(typeof live?.disposeScene==='function') live.disposeScene();
   }
@@ -2072,6 +2070,12 @@ function closeLiveStream(sessionId, streamId, source){
   if(!live) return;
   if(streamId&&live.streamId!==streamId) return;
   if(source&&live.source!==source) return;
+  // A terminal finish can call _closeSource recursively. The outer detach owns
+  // the ordered teardown, while the finalizer retains its current generation.
+  if(live.closingScene) return;
+  live.closingScene=true;
+  if(typeof live.finishScene==='function') live.finishScene();
+  if(LIVE_STREAMS[sessionId]!==live) return;
   if(typeof live.flushScene==='function') live.flushScene();
   // Snapshot the current live-turn DOM BEFORE tearing the stream down. The
   // per-event snapshot (snapshotLiveTurn) only fires on content/tool_complete
@@ -3010,8 +3014,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _committingLivePaint=false;
   let _livePaintScrollSnapshot=null;
   function _disposeAnchorScenePaint(){
+    if(typeof _releaseAnchorSceneRenderProjections==='function') _releaseAnchorSceneRenderProjections(activeSid,streamId);
     _anchorPaintGeneration++;
     _anchorPaintDisposed=true;
+    if(typeof _semanticProseTimer!=='undefined'&&_semanticProseTimer!==null){
+      clearTimeout(_semanticProseTimer);_semanticProseTimer=null;
+    }
     _cancelAnchorRegistryCleanup();
     _pendingTerminalFinish=null;
     if(_terminalFadeTimer!==null) clearTimeout(_terminalFadeTimer);
@@ -4595,6 +4603,39 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _streamDisplay(){
     return _extractInlineThinkingFromContent(_stripXmlToolCalls(assistantText), liveReasoningText, {streaming:true}).content;
   }
+  let _semanticProseTimer=null;
+  let _semanticProseDirty=false;
+  function _drainSemanticProse(){
+    if(_semanticProseTimer!==null) clearTimeout(_semanticProseTimer);
+    _semanticProseTimer=null;
+    if(!_semanticProseDirty||_anchorPaintDisposed) return;
+    _semanticProseDirty=false;
+    syncInflightAssistantMessage();
+    const parsed=segmentStart===0||!assistantRow ? _parseStreamState() : null;
+    const prose=segmentStart===0 ? (parsed.displayText||'')
+      : _parseCurrentSegmentDisplayText();
+    if(!assistantRow&&S.session?.session_id===activeSid){
+      if(String(parsed.displayText||'').trim()) ensureAssistantRow();
+      _scheduleRender(parsed);
+    }
+    if(String(prose).trim()) _upsertAnchorProcessProse(prose);
+  }
+  function _scheduleSemanticProse(){
+    _semanticProseDirty=true;
+    if(_semanticProseTimer!==null) return;
+    const timer=setTimeout(()=>{
+      if(_semanticProseTimer!==timer||_anchorPaintDisposed) return;
+      _drainSemanticProse();
+    },32);
+    _semanticProseTimer=timer;
+  }
+  function _parseCurrentSegmentDisplayText(){
+    // Use the same code-aware thinking semantics for post-tool prose as for
+    // the first segment. Never project reasoning tags as raw activity prose.
+    return _extractInlineThinkingFromContent(
+      _stripXmlToolCalls(assistantText.slice(segmentStart)),liveReasoningText,
+      {streaming:true}).displayText||'';
+  }
   function _parseStreamState(){
     return _extractInlineThinkingFromContent(_stripXmlToolCalls(assistantText), liveReasoningText, {streaming:true});
   }
@@ -5454,7 +5495,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const parsed=_parseStreamState();
     return segmentStart===0
       ? parsed.displayText
-      : _stripXmlToolCalls(assistantText.slice(segmentStart));
+      : _parseCurrentSegmentDisplayText();
   }
   function _drainStreamFadeBeforeDone(onDone){
     const fadeGeneration=_anchorPaintGeneration;
@@ -5504,7 +5545,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(_renderPending) _cancelAnimationFramePendingStreamRender();
     const displayText=segmentStart===0
       ? _parseStreamState().displayText
-      : _stripXmlToolCalls(assistantText.slice(segmentStart));
+      : _parseCurrentSegmentDisplayText();
     if(_smdParser){
       _smdWrite(displayText);
     } else if(window.smd){
@@ -5852,7 +5893,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _renderLiveThinking(parsed);
       const displayText = segmentStart===0
         ? parsed.displayText                          // first segment: uses think-tag stripping
-        : _stripXmlToolCalls(assistantText.slice(segmentStart));
+        : _parseCurrentSegmentDisplayText();
       let anchorProcessText=displayText;
       if(assistantBody){
         if(_shouldUseLiveProseFade()){
@@ -5878,7 +5919,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             // parsed.displayText and users see unformatted markdown until done.
             const fallbackText = segmentStart===0
               ? parsed.displayText
-              : _stripXmlToolCalls(assistantText.slice(segmentStart));
+              : _parseCurrentSegmentDisplayText();
             assistantBody.innerHTML = renderMd ? renderMd(fallbackText) : esc(fallbackText);
           }
         }
@@ -5912,9 +5953,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _wireSSE(source){
     const existingLive=LIVE_STREAMS[activeSid];
     if(existingLive&&existingLive.source&&existingLive.source!==source){
-      if(typeof existingLive.flushScene==='function') existingLive.flushScene();
-      if(typeof existingLive.disposeScene==='function') existingLive.disposeScene();
-      try{if(existingLive.source.readyState!==2)existingLive.source.close();}catch(_){ }
+      closeLiveStream(activeSid,existingLive.streamId,existingLive.source);
     }
     _anchorPaintDisposed=false;
     if(typeof _activateAnchorRegistry==='function') _activateAnchorRegistry();
@@ -5929,12 +5968,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // First semantic terminal event owns completion. Late producer/cursor
       // callbacks cannot compete while its optional visual fade is pending.
       if(_terminalStateReached){
-        if(type==='stream_end'||type==='error'||type==='apperror'||type==='cancel'){
+        // Only accepted deferred done work may be drained by a transport tail.
+        // Cancel's asynchronous canonical fetch retains its own settlement owner.
+        if(_pendingTerminalFinish&&(type==='stream_end'||type==='error'||type==='apperror'||type==='cancel')){
           _completeOwnedTerminal();
           _closeSource(source);
         }
         return;
       }
+      // Drain receipt-owned prose before any semantic boundary can reorder it.
+      if(type!=='token'&&typeof _drainSemanticProse==='function') _drainSemanticProse();
       // Terminal handlers may dispose synchronously. Preserve their journal
       // cursor before that disposal suppresses the separate cursor listener.
       if(type==='done'||type==='cancel'||type==='apperror') _rememberRunJournalCursor(event);
@@ -5948,7 +5991,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _renderAnchorLiveScene();
         return true;
       },
-      finishScene:()=>{if(isCurrentGeneration()) _completeOwnedTerminal();},
+      finishScene:()=>{if(isCurrentGeneration()){_drainSemanticProse();_completeOwnedTerminal();}},
       flushScene:()=>{if(isCurrentGeneration()) _anchorPaintScheduler?.flush();},
       disposeScene:()=>{if(isCurrentGeneration()) _disposeAnchorScenePaint();},
     };
@@ -5972,29 +6015,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(_terminalStateReached||_streamFinalized) return;
       const d=JSON.parse(e.data);
       assistantText+=d.text;
-      syncInflightAssistantMessage();
+      _scheduleSemanticProse();
       if(!S.session||S.session.session_id!==activeSid) return;
       _completeAutomaticCompressionOnLiveProgress(activeSid);
       if(_freshSegment) appendThinking('', _liveThinkingPlacement());
-      // Once the assistant row exists its creation gate is already satisfied, and
-      // the throttled _doRender re-parses once per frame anyway — so the per-token
-      // full-text parse here is pure waste (O(n)/token -> O(n^2) over the answer).
-      // Still call ensureAssistantRow() every token exactly as before (cheap; it
-      // also starts a new segment on a post-tool _freshSegment). Only the parse is
-      // skipped, and only once the row exists. (#5455 WS2.3)
+      // Creating the first prose row and extracting inline thinking are owned
+      // by the independent semantic batch, not by each token or a paint frame.
       if(assistantRow){
         ensureAssistantRow();
         _scheduleRender();
-      }else{
-        const parsed=_parseStreamState();
-        if(String((parsed&&parsed.displayText)||'').trim()) ensureAssistantRow();
-        _scheduleRender(parsed);
       }
-      // Semantic order is assigned on receipt, never by a later paint callback.
-      const synchronousProse=segmentStart===0
-        ? (_parseStreamState().displayText||'')
-        : _stripXmlToolCalls(assistantText.slice(segmentStart));
-      if(String(synchronousProse).trim()) _upsertAnchorProcessProse(synchronousProse);
     });
 
     source.addEventListener('interim_assistant',e=>{
@@ -6113,7 +6143,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!tc) return;
       const pendingDisplayTextBeforeTool=segmentStart===0
         ? (_parseStreamState().displayText||'')
-        : _stripXmlToolCalls(assistantText.slice(segmentStart));
+        : _parseCurrentSegmentDisplayText();
       if(String(pendingDisplayTextBeforeTool||'').trim()) _upsertAnchorProcessProse(pendingDisplayTextBeforeTool,{sealed:true});
       _applyToAnchor('tool',{...d,...tc},e);
 
@@ -6126,7 +6156,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const oldRow=$('toolRunningRow');if(oldRow)oldRow.remove();
       const pendingDisplayText=segmentStart===0
         ? (_parseStreamState().displayText||'')
-        : _stripXmlToolCalls(assistantText.slice(segmentStart));
+        : _parseCurrentSegmentDisplayText();
       if((assistantRow&&assistantBody)||String(pendingDisplayText||'').trim()){
         ensureAssistantRow(true);
       }
@@ -6150,7 +6180,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       tc.is_error=!!d.is_error;
       const pendingDisplayTextBeforeComplete=segmentStart===0
         ? (_parseStreamState().displayText||'')
-        : _stripXmlToolCalls(assistantText.slice(segmentStart));
+        : _parseCurrentSegmentDisplayText();
       if(String(pendingDisplayTextBeforeComplete||'').trim()) _upsertAnchorProcessProse(pendingDisplayTextBeforeComplete,{sealed:true});
       _applyToAnchor('tool_complete',{...d,...tc,is_error:!!d.is_error},e);
       if(typeof noteWorkspaceMutationsFromToolCall==='function') noteWorkspaceMutationsFromToolCall(tc);
@@ -6161,7 +6191,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(tc._createdByComplete){
         const pendingDisplayText=segmentStart===0
           ? (_parseStreamState().displayText||'')
-          : _stripXmlToolCalls(assistantText.slice(segmentStart));
+          : _parseCurrentSegmentDisplayText();
         if((assistantRow&&assistantBody)||String(pendingDisplayText||'').trim()){
           ensureAssistantRow(true);
           _flushPendingSegmentRender({force:true});
@@ -6845,6 +6875,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _clearClarifyForOwner('terminal');
       let d={};
       try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
+      let _errorRecoveryPending=false;
       const _extensionErrorType=(d.type==='cancelled'||d.type==='interrupted')?'turn:cancel':'turn:error';
       const currentSid=S.session&&S.session.session_id;
       const eventSid=d.old_session_id||d.session_id||'';
@@ -6926,12 +6957,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           },0);
         }
         if(isRecoveryControlMessage){
+          _errorRecoveryPending=true;
           (async()=>{
-            if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
-            if(S.session&&S.session.session_id===activeSid){
-              S.messages=_filterRecoveryControlMessages(S.messages||[]);
-              _markSessionViewed(activeSid, S.messages.length);
-              renderMessages({preserveScroll:true});
+            try{
+              if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
+              if(S.session&&S.session.session_id===activeSid){
+                S.messages=_filterRecoveryControlMessages(S.messages||[]);
+                _markSessionViewed(activeSid, S.messages.length);
+                renderMessages({preserveScroll:true});
+              }
+            }finally{
+              closeLiveStream(activeSid,streamId,source);
             }
           })();
         } else {
@@ -6948,6 +6984,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         status:d.status||d.type||(_extensionErrorType==='turn:cancel'?'cancelled':'error'),
         endedAt:Date.now()/1000,
       });
+      // Transport closure alone does not retire the logical owner or its cache.
+      if(!_errorRecoveryPending) closeLiveStream(activeSid,streamId,source);
     });
 
     source.addEventListener('warning',e=>{
@@ -7198,7 +7236,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       })();
     });
 
-    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','todo_state','approval','clarify','state_saved','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
+    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','todo_state','approval','clarify','state_saved','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error']){
       source.addEventListener(_runJournalEventName,_rememberRunJournalCursor);
     }
     source.addEventListener=addOwnedListener;

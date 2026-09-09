@@ -23,9 +23,12 @@ The normalized-event replay API preserves its already-normalized provenance.
 
 ## Semantic and visual ownership
 
-Synchronous producer callbacks ingest prose, reasoning and tool state into the
-turn's anchor. Normal frame paints and terminal fade steps only project that
-state; they must not upsert semantic prose as a consequence of painting.
+Producer receipt appends token text synchronously. An independent 32 ms semantic
+batch extracts prose/inline thinking and synchronizes inflight messages; every
+non-token event and owner detach drains pending prose before its boundary.
+Reasoning and tool callbacks then ingest their state in receipt order. Normal
+frame paints and terminal fade steps only project existing state; they must not
+upsert semantic prose as a consequence of painting.
 
 The stream closure owns the live scene scheduler, generation, pending terminal
 completion, fade timeout/frame, snapshot/persistence timers and registry cleanup.
@@ -38,10 +41,13 @@ it. Already-dispatched callbacks must check the current generation and, where
 applicable, the exact scheduled timer handle. Cancellation alone is not proof
 that a callback cannot execute.
 
-Explicit supersession/disposal invalidates the owner and clears the pending
-completion. It is not permission for an obsolete owner to finalize a successor.
-Page teardown first asks the current owner to complete an already-received
-terminal result, then uses the existing detach/reattach handoff. A bfcache
+The identity-checked `closeLiveStream` contract is shared by ordinary detach,
+session switch, source supersession and page teardown: finish accepted terminal
+work exactly once, flush, snapshot, dispose, then close. A reentrant terminal
+close leaves this sequence owned by the outer detach. Replaced owners cannot
+finish or dispose successors. A payload-less cancel retains its primary async
+canonical-session settlement owner; cursor capture and queued transport tails
+must not dispose it during the fetch. A bfcache
 `pageshow` uses canonical session loading when an inflight attachment needs
 restoring; it does not revive the disposed owner. Session-switch detachment
 retains the existing journal-replay recovery contract.
@@ -61,6 +67,15 @@ private live path from explicit public materialization.
 Initial construction still uses the full projection. The renderer also retains
 its explicit terminal-row fail-closed branch; terminal settlement is not a
 steady-state paint. Genuine identity/order uncertainty continues to rebuild.
+
+## Projection-cache lifetime
+
+Renderer projection entries retain explicit session, stream and turn identity.
+Only live projections are cached. Settled projections evict the corresponding
+live entry and are rebuilt without historical cache retention. The current
+stream's disposal releases its entries after flush/snapshot; identity-guarded
+callbacks prevent retired sources from releasing a successor's state. Eviction
+changes only acceleration state, never semantic rows or persisted transcripts.
 
 ## Settled persistence
 

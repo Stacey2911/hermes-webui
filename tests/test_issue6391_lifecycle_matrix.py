@@ -161,6 +161,7 @@ const _parseStreamState=()=>({displayText:assistantText});
 const ensureAssistantRow=()=>{};
 const _scheduleRender=()=>{};
 const _upsertAnchorProcessProse=()=>{tokenEffects+=1;};
+const _scheduleSemanticProse=()=>{tokenEffects+=1;};
 const _withDeferredAnchorScenePaint=handler=>handler;
 const _renderAnchorLiveScene=()=>true;
 const segmentStart=0;

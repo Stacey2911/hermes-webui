@@ -5,11 +5,14 @@ def test_pagehide_finishes_before_detach_and_bfcache_uses_canonical_reload():
     run_js(r"""
 const order=[],LIVE_STREAMS={s:{streamId:'r',finishScene(){order.push('finish');},disposeScene(){order.push('dispose');}}};
 const INFLIGHT={s:{streamId:'r'}},S={session:{session_id:'s'}};
-const closeLiveStream=(sid,rid,source)=>{order.push('detach');delete LIVE_STREAMS[sid];INFLIGHT[sid].reattach=true;};
+const snapshotLiveTurnHtmlForSession=()=>{};
+const _resumeSessionStreamAfterLiveChat=()=>{};
+const saveInflightState=()=>{};
+eval(extract(messageSource,'closeLiveStream'));
 const loadSession=sid=>{order.push('reload:'+sid);return Promise.resolve();};
 eval(extract(messageSource,'_disposeLiveScenePaints'));
 eval(extract(messageSource,'_restoreLiveSceneAfterPageShow'));
-_disposeLiveScenePaints();assert.deepEqual(order,['finish','detach']);assert.equal(Object.keys(LIVE_STREAMS).length,0);
+_disposeLiveScenePaints();assert.deepEqual(order,['finish','dispose']);assert.equal(Object.keys(LIVE_STREAMS).length,0);
 _restoreLiveSceneAfterPageShow({persisted:true});assert.equal(order.at(-1),'reload:s');
 const count=order.length;_restoreLiveSceneAfterPageShow({persisted:false});assert.equal(order.length,count);
 """)
