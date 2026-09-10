@@ -4,7 +4,7 @@ from tests.test_issue6391_live_scene_paint import run_js
 def test_segment_paint_cannot_mutate_anchor_prose():
     run_js(r"""
 let _renderPending=false,assistantBody={innerHTML:''},segmentStart=0,assistantText='owned prose';
-const _isActiveSession=()=>true,_parseStreamState=()=>({displayText:assistantText});
+const _isActiveSession=()=>true,_semanticSnapshot=()=>({displayText:assistantText});
 const _stripXmlToolCalls=x=>x,_smdParser=null,window={},renderMd=x=>x;
 const assistantRow={};let mutations=0;
 const _upsertAnchorProcessProse=()=>mutations++;

@@ -113,6 +113,7 @@ let _deferAnchorScenePaint=false, _anchorPaintScheduler=scheduler;
 let _anchorPaintGeneration=0, _anchorPaintDisposed=false;
 let _pendingProsePaint=null,_committingLivePaint=false,_pendingKatexPaint=false,_persistTimer=null; const _pendingMediaPaintRoots=new Set();
 let cancelledSnapshotTimers=0;
+let _semanticState={pending:'<thi',content:'retained'.repeat(10000)},_semanticFallback={content:'fallback'},_semanticRaw='raw';
 const _cancelAnimationFramePendingStreamRender=()=>{};
 const _clearStreamEndRecovery=()=>{};
 const _cancelThrottledSnapshotTimer=()=>{cancelledSnapshotTimers++;};
@@ -122,6 +123,7 @@ const oldHandler=_withDeferredAnchorScenePaint(e=>{events.push(e);scheduler.requ
 oldHandler('start');
 _disposeAnchorScenePaint();
 assert.equal(cancelledSnapshotTimers,1,'dispose must cancel trailing DOM snapshots');
+assert.equal(_semanticState,null);assert.equal(_semanticFallback,null);assert.equal(_semanticRaw,'');
 oldHandler('late-complete');
 frame();
 assert.deepEqual(events,['start'],'disposed source must reject queued tool events');

@@ -1,25 +1,32 @@
 """Payload-less cancellation keeps its async canonical settlement owner."""
 import pytest
 from tests.test_issue6391_live_scene_paint import run_js
+from tests.test_issue7478_spaced_semantic import helpers as semantic_helpers, runtime
 
 
+@pytest.mark.parametrize('tail', ['', '<thi'])
+@pytest.mark.parametrize('spacing', [0, 40])
 @pytest.mark.parametrize('has_row', [True, False])
-def test_wire_cancel_awaits_canonical_snapshot(has_row):
-    run_js(r"""
+def test_wire_cancel_awaits_canonical_snapshot(has_row, spacing, tail):
+    run_js(semantic_helpers() + r"""
 (async()=>{
+""" + runtime() + r"""
 let _anchorPaintGeneration=0,_anchorPaintDisposed=false,_anchorPaintScheduler=null;
 let _terminalStateReached=false,_streamFinalized=false,_persistTimer=null;
 const activeSid='s',streamId='r',LIVE_STREAMS={};
 const S={session:{session_id:'s'},messages:[],activeStreamId:'r'};
-let assistantText='partial',closed=0,lifecycle=0,rendered=0;
+let assistantText='',liveReasoningText='',closed=0,lifecycle=0,rendered=0;
 let segmentStart=0,_semanticProseTimer=null,_semanticProseDirty=false,scans=0,semanticText='';
-const setTimeout=()=>1,clearTimeout=()=>{};
+let time=0,timerId=0;const timers=new Map();
+const setTimeout=(fn,ms)=>{timers.set(++timerId,{fn,at:time+ms});return timerId;},clearTimeout=id=>timers.delete(id);
+function advance(){time+=SPACING;for(const [id,t]of [...timers])if(t.at<=time){timers.delete(id);t.fn();}}
 const assistantRow=ASSISTANT_ROW,_freshSegment=false;
 let inflightScans=0;
 const syncInflightAssistantMessage=()=>{inflightScans++;},_completeAutomaticCompressionOnLiveProgress=()=>{};
-const ensureAssistantRow=()=>{},_scheduleRender=()=>{};
-const _parseStreamState=()=>{scans++;return {displayText:assistantText};};
-const _stripXmlToolCalls=x=>x,_upsertAnchorProcessProse=x=>{semanticText=x;};
+const ensureAssistantRow=()=>{};
+eval(extract(messageSource,'_stripXmlToolCalls'));eval(extract(messageSource,'_parseStreamState'));
+const fullParse=_parseStreamState;_parseStreamState=()=>{scans++;return fullParse();};
+const _upsertAnchorProcessProse=x=>{semanticText=x;};
 for(const f of ['_drainSemanticProse','_scheduleSemanticProse']) eval(extract(messageSource,f));
 let resolveFetch; const api=()=>new Promise(resolve=>{resolveFetch=resolve;});
 const _bailOutOfTerminalEventsFromStaleStream=()=>false;
@@ -41,12 +48,14 @@ const _closeSource=()=>{_anchorPaintGeneration++;_anchorPaintDisposed=true;delet
 const callbacks=[];
 const source={readyState:1,close(){closed++;this.readyState=2;},addEventListener(type,fn){callbacks.push({type,fn});}};
 eval(extract(messageSource,'_wireSSE')); _wireSSE(source);
-for(let i=0;i<10000;i++) for(const x of callbacks.filter(x=>x.type==='token')) x.fn({data:'{"text":"x"}'});
+for(let i=0;i<10000;i++){for(const x of callbacks.filter(x=>x.type==='token')) x.fn({data:'{"text":"x"}'});advance();}
 assert.equal(scans,0,'the actual token handler must not scan full history');
-assert.equal(inflightScans,0,'inflight thinking extraction must also be batched');
+assert.equal(inflightScans,SPACING?10000:0,'publication follows virtual time, not parsing');
+if(TAIL)for(const x of callbacks.filter(x=>x.type==='token'))x.fn({data:JSON.stringify({text:TAIL})});
 for(const x of callbacks.filter(x=>x.type==='cancel')) x.fn({data:'{}'});
-assert.equal(scans,1,'terminal boundary drains the coalesced semantic state');
-assert.equal(semanticText,assistantText);
+assert.equal(scans,TAIL?1:0,'only terminal partial-delimiter fallback may rescan');
+assert.equal(_semanticState.stats.incrementalBytes,10000+TAIL.length);
+assert.equal(semanticText,'x'.repeat(10000));
 for(const x of callbacks.filter(x=>x.type==='stream_end')) x.fn({data:'{}'});
 assert.equal(_anchorPaintDisposed,false,'auxiliary cancel must not dispose pending canonical settlement');
 assert.equal(typeof resolveFetch,'function');
@@ -56,4 +65,4 @@ assert.equal(S.messages[0].content,'canonical partial');
 assert.equal(rendered,1);assert.equal(lifecycle,1);assert.equal(closed,1);
 assert.equal(LIVE_STREAMS.s,undefined);
 })().catch(error=>{console.error(error);process.exitCode=1;});
-""".replace('ASSISTANT_ROW', '{}' if has_row else 'null'))
+""".replace('ASSISTANT_ROW', '{}' if has_row else 'null').replace('SPACING',str(spacing)).replace('TAIL',repr(tail)))
