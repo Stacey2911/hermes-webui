@@ -848,6 +848,9 @@ def main() -> int:
         errors = _capture_page_errors(page)
         page.goto("/", wait_until="domcontentloaded")
         page.wait_for_selector("#msg", state="visible", timeout=15000)
+        # Isolate the lifecycle under test from concurrent first-session boot.
+        # Await real session creation before the real composer starts its run.
+        page.evaluate("async () => { await newSession(); }")
         page.locator("#msg").fill(PROMPT)
         page.locator("#btnSend").click()
 
