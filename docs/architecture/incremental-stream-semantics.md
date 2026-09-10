@@ -99,3 +99,20 @@ error and disposal regressions cover pending delimiter and state-release paths.
 The source-extraction test harnesses execute only in an authorized local test
 sandbox. A maintainer threat-policy NO-RUN classification is not a test failure
 or a product defect, and local results do not imply maintainer approval.
+
+## Legacy segment ownership during incremental paints
+
+A reasoning-only scene can paint before the first prose token arrives. New
+compatibility assistant segments must be hidden at creation when that live scene
+already owns presentation (Compact Worklog or Transparent Stream). They remain
+available to the stream's Markdown/fade and metadata paths; the scene renders the
+visible prose. Final-answer-only mode keeps its compatibility body visible.
+This constant-work handoff avoids restoring a full legacy-node scan on every
+incremental paint. Terminal settlement still renders the canonical final/error
+answer through its existing path.
+
+The lifecycle gate's `LIFECYCLE_REASONING_FIRST=1` waits for the reasoning scene
+before releasing prose/tools. This pins the previously timing-sensitive ordering
+without probabilistic sleeps or retries. It runs for both normal and terminal
+error scenarios; `test_issue7478_live_prose_ownership.py` additionally checks
+visibility at insertion, repeated segments, and the no-scene/hidden-activity modes.

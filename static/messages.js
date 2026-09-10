@@ -2942,6 +2942,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     assistantRow.setAttribute('data-live-segment-seq',String(_assistantSegmentSeq));
     assistantBody=document.createElement('div');assistantBody.className='msg-body';
     assistantRow.appendChild(assistantBody);
+    // A reasoning-only scene may already own presentation before prose arrives.
+    // Incremental scene paints intentionally skip the full legacy-node sweep;
+    // retire this new compatibility anchor at creation, not on a later frame.
+    if(typeof chatActivityMode==='function'&&chatActivityMode()!=='hide_all_activity'&&
+       typeof isLiveAnchorActivitySceneOwner==='function'&&isLiveAnchorActivitySceneOwner(streamId)){
+      assistantRow.classList.add('assistant-segment-worklog-source');
+      assistantRow.setAttribute('aria-hidden','true');
+      assistantRow.hidden=true;
+    }
     blocks.appendChild(assistantRow);
     if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
     if(INFLIGHT[activeSid]){
