@@ -2645,6 +2645,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
   }
   function persistInflightState(){
+    // Receipt advances the journal cursor before the batched prose publication.
+    // Publish that pending prefix at this existing persistence boundary, not on
+    // each token. Keep delimiter lookahead incremental; this is not a terminal
+    // parse/paint flush and must not settle a partial thinking/tool marker.
+    _drainSemanticProse('semantic');
     const inflight=INFLIGHT[activeSid];
     if(!inflight||typeof saveInflightState!=='function') return;
     saveInflightState(activeSid,{
