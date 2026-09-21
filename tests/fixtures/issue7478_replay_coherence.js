@@ -42,6 +42,10 @@ async (scenario = 'user-only') => {
       ? [{role: 'user', content: 'old prompt'}, {role: 'assistant', content: 'old answer'}, {role: 'user', content: 'current prompt'}]
       : [{role: 'user', content: 'current prompt'}];
     S.busy = true; S.activeStreamId = stream;
+    // This synthetic turn bypasses send(): establish its sidebar owner too.
+    // Otherwise the title event's cache render can purge INFLIGHT when the
+    // fresh session's idle row has arrived, before replay is exercised.
+    upsertActiveSessionForLocalTurn({messageCount: S.messages.length});
     INFLIGHT[sid] = {streamId: stream, messages: [...S.messages], toolCalls: [], uploaded: []};
     markInflight(sid, stream);
     attachLiveStream(sid, stream, [], {});
