@@ -1,5 +1,6 @@
 """Hermes Web UI -- Session model and in-memory session store."""
 import collections
+import contextvars
 import copy
 import datetime
 import hashlib
@@ -34,7 +35,7 @@ from api.config import (
     LOCK, STREAMS, STREAMS_LOCK, DEFAULT_WORKSPACE, DEFAULT_MODEL, PROJECTS_FILE, HOME,
     get_effective_default_model, _get_session_agent_lock,
 )
-from api.workspace import get_last_workspace
+from api.workspace import get_last_workspace, _resolve_path, profile_home_resolve_cache_scope
 from api.usage import prompt_cache_hit_percent
 from api.agent_sessions import (
     _is_continuation_session,
@@ -47,7 +48,11 @@ from api.agent_sessions import (
 from api.process_event_utils import stamp_message_source
 
 logger = logging.getLogger(__name__)
-CLI_VISIBLE_SESSION_LIMIT = 20
+# Size of the interactive sidebar recency window. Also bounds how many
+# delegated subagent children can be rendered at once, since a child only
+# nests when it wins a slot in this window. Resolved in api.config before
+# profile init; override with HERMES_WEBUI_VISIBLE_SESSION_LIMIT (clamped 1–200).
+CLI_VISIBLE_SESSION_LIMIT = _cfg.CLI_VISIBLE_SESSION_LIMIT
 # How many messageful cron sessions to surface in the project-chip layer.
 # Needs to exceed CLI_VISIBLE_SESSION_LIMIT so older cron runs stay
 # addressable even when many newer non-cron sessions dominate the default
@@ -1084,7 +1089,34 @@ def _read_file_head(path: Path, max_prefix_bytes: int = 4096) -> str:
         return fp.read(max_prefix_bytes).decode('utf-8', errors='ignore')
 
 
-def _read_metadata_json_prefix(path, max_prefix_bytes=65536):
+#: Budget for the cheap metadata read. Sized as a BACKSTOP, not a target: the
+#: prefix normally stops at ``messages`` after a few KB, and the write-side field
+#: order keeps it there. The cap only matters for a sidecar already on disk whose
+#: heavy metadata blobs serialize BEFORE ``messages`` — where the old 64 KB cap
+#: turned one oversized field into a full multi-MB parse on EVERY poll (#4633).
+#: Measured case: a 73,192-byte ``compression_anchor_summary`` pushed the
+#: ``messages`` key to offset 76,603, so the read gave up 11 KB short of it.
+_METADATA_PREFIX_MAX_BYTES = 1024 * 1024
+
+#: Size of the FIRST stage of the cheap metadata read. A healthy sidecar carries
+#: its stop key (`messages`) within a few KB — the write-side field order in
+#: ``save()`` guarantees it — so every ordinary poll pays this read and stops
+#: there. The 1 MiB backstop above is only reached by a sidecar already on disk
+#: whose heavy metadata blobs really do precede ``messages`` in bulk. Without a
+#: small first stage the cheap read pulls the whole budget on the polling path
+#: even when the stop key sits at 2 KB.
+_METADATA_PREFIX_FIRST_STAGE_BYTES = 64 * 1024
+
+# Marks a sidecar as written by the CURRENT writer contract, where the
+# persisted `message_count` equals len(messages) by construction (both keys
+# land in the same atomic write). save()'s bounded-prefix shrink check trusts
+# a persisted count ONLY when this marker sits next to it in the file; see
+# _prefix_message_count(). Bump the value whenever the writer contract changes
+# meaning, so counts from an older contract fall back to the full parse.
+_MESSAGE_COUNT_MARKER = 1
+
+
+def _read_metadata_json_prefix(path, max_prefix_bytes=_METADATA_PREFIX_MAX_BYTES):
     """Read only the metadata portion before the large arrays.
 
     #5854: stop at the top-level ``messages`` key OR the top-level
@@ -1097,24 +1129,58 @@ def _read_metadata_json_prefix(path, max_prefix_bytes=65536):
     the scenes-stop a legacy large-scene sidecar overflows ``max_prefix_bytes``
     and forces a full multi-MB parse on every poll (the #4633 churn).
     """
+    if max_prefix_bytes <= 0:
+        return None
+    # Geometric staged reads: 64 KiB, 128 KiB, 256 KiB, ... up to the backstop.
+    #
+    # The original loop read 4096 bytes at a time and re-scanned the WHOLE
+    # accumulated buffer after each chunk — two full `_find_top_level_json_key`
+    # passes (a pure-Python char loop) plus a decode per chunk. That is O(n^2) in
+    # the prefix size, and it is why the cap could not simply be raised.
+    # Measured on this function before the change:
+    #     prefix    10 KB ->     19.6 ms
+    #     prefix    60 KB ->     87.3 ms     <- already paid on EVERY poll
+    #     prefix   200 KB ->    768.9 ms
+    #     prefix   500 KB ->  4,634.7 ms
+    #     prefix   900 KB -> 14,957.1 ms     <- slower than the full parse
+    #
+    # A single `f.read(max_prefix_bytes)` fixed that complexity but pulled the
+    # whole 1 MiB backstop on every poll, even when the stop key sat at 2 KB —
+    # read amplification on a path that runs once per sidebar poll. Doubling
+    # stages keep both properties: the COMMON case stops inside the first small
+    # read, and re-scanning each accumulated stage stays linear because the stage
+    # sizes form a bounded geometric series (total work < 2x the bytes actually
+    # read, worst case). `_find_top_level_json_key` returns AT the key, so the
+    # final scan costs O(offset of the stop key), not O(stage).
+    stage = min(_METADATA_PREFIX_FIRST_STAGE_BYTES, max_prefix_bytes)
+    raw = b''
     buf = ''
-    with open(path, 'r', encoding='utf-8') as f:
-        while len(buf.encode('utf-8')) < max_prefix_bytes:
-            chunk = f.read(4096)
+    stop_pos = None
+    with open(path, 'rb') as f:
+        while len(raw) < max_prefix_bytes:
+            chunk = f.read(min(stage, max_prefix_bytes - len(raw)))
             if not chunk:
+                # EOF before the stop key: no metadata prefix to serve, so the
+                # caller falls back to a full parse (same answer as a budget miss).
                 return None
-            buf += chunk
+            raw += chunk
+            # A byte budget can truncate a multi-byte character at the boundary;
+            # dropping it is safe because a stop key straddling the cap is a miss
+            # either way.
+            buf = raw.decode('utf-8', errors='ignore')
             stop_pos = _find_top_level_json_key(buf, 'messages')
             scenes_pos = _find_top_level_json_key(buf, 'anchor_activity_scenes')
             if scenes_pos is not None and (stop_pos is None or scenes_pos < stop_pos):
                 stop_pos = scenes_pos
-            if stop_pos is None:
-                continue
-            prefix = buf[:stop_pos].rstrip()
-            if prefix.endswith(','):
-                prefix = prefix[:-1].rstrip()
-            return f'{prefix}\n}}'
-    return None
+            if stop_pos is not None:
+                break
+            stage *= 2
+    if stop_pos is None:
+        return None
+    prefix = buf[:stop_pos].rstrip()
+    if prefix.endswith(','):
+        prefix = prefix[:-1].rstrip()
+    return f'{prefix}\n}}'
 
 
 def _load_session_from_path(path: Path) -> "Session | None":
@@ -1191,6 +1257,25 @@ def model_explicit_pick_signature(model, model_provider) -> str:
     return f"{_m}\x1f{_p}"
 
 
+_SIDEBAR_HEAVY_METADATA_FIELDS = (
+    'compression_anchor_summary',
+    'compression_anchor_details',
+    'context_engine_state',
+    'compression_recovery',
+    'gateway_routing_history',
+    'composer_draft',
+    'process_wakeup_pause',
+    'share_token',
+)
+
+
+def _strip_sidebar_heavy_metadata(row: dict) -> dict:
+    """Remove detail-only values after sidebar reconciliation is complete."""
+    for key in _SIDEBAR_HEAVY_METADATA_FIELDS:
+        row.pop(key, None)
+    return row
+
+
 class Session:
     def __init__(self, session_id: str=None, title: str='Untitled',
                  workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
@@ -1245,7 +1330,8 @@ class Session:
                  **kwargs):
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.title = title
-        self.workspace = str(Path(workspace).expanduser().resolve())
+        self.profile = profile
+        self.workspace = str(_resolve_path(workspace, profile=profile))
         # #6672: immutable snapshot of the workspace at session creation time.
         # s.workspace is updated on every turn when the user switches workspaces
         # mid-session via the WebUI header dropdown; interpolating the live
@@ -1257,7 +1343,7 @@ class Session:
         # without a persisted created_workspace fall back to the workspace
         # recorded on disk, which is the best available approximation.
         self.created_workspace = (
-            str(Path(created_workspace).expanduser().resolve())
+            str(_resolve_path(created_workspace, profile=profile))
             if created_workspace
             else self.workspace
         )
@@ -1427,6 +1513,16 @@ class Session:
         # legacy-format reader that stops at a scene key still finds the count.
         # The full anchor_activity_scenes bodies serialize AFTER messages.
         meta['message_count'] = len(self.messages or [])
+        # _mc_v marks this file as written by the current writer contract,
+        # where `message_count` equals len(messages) by construction and both
+        # keys land in the same atomic write. save()'s shrink guard takes the
+        # bounded-prefix shortcut ONLY for marked files; an unmarked count
+        # (a legacy pre-#5854 sidecar, a sidecar materialized by an older
+        # recovery writer, any foreign writer) gets the full parse, so a stale
+        # count from outside this contract can never read a real shrink as a
+        # growth and skip the #1558 backup. One save re-marks the file, so the
+        # fast path still covers steady state.
+        meta['_mc_v'] = _MESSAGE_COUNT_MARKER
         meta['anchor_scene_index'] = _anchor_scene_index_from_records(self.anchor_activity_scenes)
         # Keep the in-memory fingerprint aligned with what we just persisted, so a
         # later metadata-only reload of THIS object (or any fingerprint reader)
@@ -1439,7 +1535,7 @@ class Session:
         meta['anchor_activity_scenes'] = self.anchor_activity_scenes if isinstance(self.anchor_activity_scenes, dict) else {}
         # Fields not in METADATA_FIELDS (e.g. last_usage) go at the end. Exclude
         # the keys we placed explicitly above so they aren't emitted twice.
-        _placed = {'message_count', 'anchor_scene_index', 'messages', 'tool_calls', 'anchor_activity_scenes'}
+        _placed = {'message_count', '_mc_v', 'anchor_scene_index', 'messages', 'tool_calls', 'anchor_activity_scenes'}
         extra = {k: v for k, v in self.__dict__.items()
                  if k not in METADATA_FIELDS and k not in _placed
                  and not k.startswith('_')}
@@ -1459,12 +1555,46 @@ class Session:
         # their .bak get restored automatically.
         try:
             if self.path.exists():
-                existing_text = self.path.read_text(encoding='utf-8')
-                try:
-                    existing = json.loads(existing_text)
-                    existing_msg_count = len(existing.get('messages') or [])
-                except (json.JSONDecodeError, ValueError):
-                    existing_msg_count = -1  # corrupt → always back up
+                # The on-disk count, without reading the body.
+                #
+                # The decision below is a function of ONE integer -- how many
+                # messages the file on disk holds -- and save() already writes
+                # that integer into the metadata prefix, before `messages`, as
+                # `message_count` (see METADATA_FIELDS above; load_metadata_only
+                # and the sidebar freshness check read it the same way). So read
+                # THAT through a bounded 64 KiB prefix instead of the whole file.
+                # Measured before this: a 203,439,398-byte sidecar cost 20,377 ms
+                # (17,453 in read_text, 2,924 in json.loads) to yield one integer,
+                # on EVERY save -- including the grow-saves that never back
+                # anything up. The prefix read is O(64 KiB), and because the count
+                # is part of the bytes on disk it travels with any rewrite of them.
+                #
+                # An in-memory "I wrote this, stat says nothing changed" cache is
+                # NOT sufficient here, and was removed after review: (inode, size,
+                # mtime_ns) is not a content identity. A same-length in-place
+                # rewrite inside one mtime tick keeps all three fields -- ext4
+                # stamps mtime from a coarse clock, so two writes in the same tick
+                # share one mtime_ns -- and a stale cached count then reads a real
+                # shrink as a growth and skips the #1558 backup. The prefix count
+                # cannot be fooled that way.
+                #
+                # Every unknown falls through to the full read + parse below: a
+                # legacy (pre-#5854) sidecar whose count is not in the prefix, a
+                # count written without the current writer's _mc_v marker (an
+                # older writer's count can be stale relative to the messages
+                # array next to it), a corrupt or truncated prefix, a file with
+                # no top-level `messages` key at all, or metadata alone that
+                # overflows the budget.
+                # Fail-open is the contract -- never "assume no shrink".
+                existing_text = None
+                existing_msg_count = _prefix_message_count(self.path)
+                if existing_msg_count is None:
+                    existing_text = self.path.read_text(encoding='utf-8')
+                    try:
+                        existing = json.loads(existing_text)
+                        existing_msg_count = len(existing.get('messages') or [])
+                    except (json.JSONDecodeError, ValueError):
+                        existing_msg_count = -1  # corrupt → always back up
                 incoming_msg_count = len(self.messages or [])
                 if (
                     existing_msg_count > 0
@@ -1482,6 +1612,10 @@ class Session:
                     return
                 if existing_msg_count > incoming_msg_count:
                     bak_path = self.path.with_suffix('.json.bak')
+                    if existing_text is None:
+                        # The .bak body is the one thing that needs the full text,
+                        # and a shrink is the one time it is needed.
+                        existing_text = self.path.read_text(encoding='utf-8')
                     # SHOULD-FIX #2 (Opus): atomic write via tmp+replace,
                     # mirroring the main save() pattern below. Prevents a
                     # torn .bak from a crash mid-write or a concurrent
@@ -1584,6 +1718,18 @@ class Session:
             # expected_sig guards against an atomic replace during the read.
             # (When _collapsed_partials fired, save() above already rewrote the
             # modern layout, so no legacy caching is needed.)
+            #
+            # WHY STILL GATED, and not "obviously" broadened to modern files: the
+            # cache is only READ from the two sites that reach it when the cheap
+            # prefix carried NEITHER message_count NOR anchor_scene_index — i.e.
+            # legacy layouts (see the `if ... and 'anchor_scene_index' not in
+            # parsed` guards in load_metadata_only() and the eviction-count
+            # helper). A modern sidecar that overflows the budget therefore
+            # never consults an entry written for it, so populating one is dead
+            # work that also stores entries no consumer can use. Making the
+            # modern case benefit needs the READ side redesigned to build a
+            # metadata stub from cached facts — a separate change; until then
+            # this stays legacy-only.
             if 'anchor_scene_index' not in data:
                 try:
                     _legacy_sidecar_facts_put(
@@ -1721,7 +1867,12 @@ class Session:
                     n += 1
         return n
 
-    def compact(self, include_runtime=False, active_stream_ids=None) -> dict:
+    def compact(
+        self,
+        include_runtime=False,
+        active_stream_ids=None,
+        sidebar_metadata_only=False,
+    ) -> dict:
         active_stream_ids = active_stream_ids if active_stream_ids is not None else set()
         has_pending_user_message = bool(self.pending_user_message)
         message_count = (
@@ -1734,7 +1885,7 @@ class Session:
         last_message_at = _last_message_timestamp(self.messages) or self.updated_at
         if has_pending_user_message and self.pending_started_at:
             last_message_at = self.pending_started_at
-        return {
+        compact = {
             'session_id': self.session_id,
             'title': self.title,
             'workspace': self.workspace,
@@ -1809,6 +1960,9 @@ class Session:
                 self.active_stream_id, active_stream_ids
             ) if include_runtime else False,
         }
+        if sidebar_metadata_only:
+            _strip_sidebar_heavy_metadata(compact)
+        return compact
 
 
 PROCESS_WAKEUP_PROVIDER_UNAVAILABLE_TYPES = frozenset({
@@ -2344,6 +2498,191 @@ def _latest_user_matches_pending_text(messages, pending_text):
     return False
 
 
+def _pending_active_turn_token(session):
+    """Return the exact WebUI active-turn token for the pending turn.
+
+    The token is ``"<stream_id>:<pending_started_at>"`` — the same value the
+    eager user-message checkpoint and the agent-result merge stamp onto the
+    materialized user row (``stamp_message_source``). It is unforgeable
+    per-turn identity: two distinct streams that submit the same prompt
+    inside the same second produce different tokens.
+    """
+    from api.process_event_utils import build_active_turn_token
+
+    return build_active_turn_token(
+        getattr(session, 'active_stream_id', None),
+        getattr(session, 'pending_started_at', None),
+    )
+
+
+def _transcript_user_row_is_pending_turn(message, session, pending_token) -> bool:
+    """Return True only when a transcript user row provably IS the pending turn.
+
+    Identity is bound to the active-turn token, never to integer-second
+    timestamp equality: two different streams that send the same prompt
+    within one second truncate to the same ``int(timestamp)``, so the
+    checkpoint matcher alone would accept the *other* stream's row as the
+    pending turn. A token mismatch therefore always loses, and a row that
+    carries no token at all cannot be proven to be this turn — which means
+    the caller must recover, not suppress.
+    """
+    if not isinstance(message, dict) or message.get('role') != 'user':
+        return False
+    row_token = message.get('_active_turn_token')
+    if pending_token:
+        if not row_token:
+            # Ambiguous legacy identity: the pending turn has a resolvable
+            # token but this row predates token stamping. We cannot prove it
+            # is the same turn, so recovery must run.
+            return False
+        return row_token == pending_token
+    if row_token:
+        # The row belongs to a different, token-bearing turn. Never let a
+        # same-second timestamp collision override that mismatch.
+        return False
+    # Neither side carries a token (legacy/dead-stream pending state): fall
+    # back to the strict content + timestamp + source + attachments
+    # checkpoint, which is the only identity signal available.
+    return _message_matches_pending_checkpoint(
+        message,
+        getattr(session, 'pending_user_message', None),
+        getattr(session, 'pending_started_at', None),
+        getattr(session, 'pending_user_source', None),
+        getattr(session, 'pending_attachments', None),
+    )
+
+
+def _pending_turn_has_final_assistant_answer(messages, start_idx: int) -> bool:
+    """Return True when the matched user turn ends in a genuine final answer.
+
+    Reuses the established final-answer semantics
+    (``_assistant_message_has_final_visible_text``) instead of "an assistant
+    row exists". An assistant row only settles the turn when it carries real
+    visible answer text: empty rows, tool-call-only rows, interim
+    ``_partial`` progress rows, rows recovered from the run journal and
+    compaction reference cards are all rejected, so a turn that was
+    interrupted mid-tool-execution is never mistaken for a completed one.
+
+    The scan stops at the next real user row — a final answer that belongs
+    to a *later* turn must not settle this pending turn.
+    """
+    from api.streaming import (
+        _assistant_message_has_final_visible_text,
+        _is_synthetic_control_message,
+    )
+
+    for later in messages[start_idx + 1:]:
+        if not isinstance(later, dict):
+            continue
+        if _is_synthetic_control_message(later):
+            continue
+        role = later.get('role')
+        if role == 'user':
+            if is_context_compression_marker(later):
+                # Synthetic compaction cards are not a user-turn boundary.
+                continue
+            return False
+        if role != 'assistant':
+            # Tool rows never prove a final answer.
+            continue
+        if (
+            later.get('_partial')
+            or later.get('_error')
+            or later.get('_recovered')
+            or later.get('_recovered_from_run_journal')
+        ):
+            continue
+        if is_context_compression_marker(later):
+            continue
+        if _assistant_message_has_final_visible_text(later):
+            return True
+    return False
+
+
+def _transcript_already_advanced_past_pending(session) -> bool:
+    """#6366: a stale pending user message whose own user row already appears
+    in the durable transcript, followed by a genuine final assistant answer
+    inside that same user-turn boundary, means the transcript has already
+    advanced past this pending turn. Returning True here lets the recovery
+    path skip the recovered user / ``_partial`` clone / journal replay /
+    generic no-response error that would otherwise append after the valid
+    final answer. The tail-only check at line ~3485 (``session.messages[-1]``)
+    misses this case: when the pending turn's user row is older than
+    the transcript tail, the tail is a *newer* assistant row that
+    can never match the pending **user** checkpoint, and the recovery
+    path falls through into the append branch.
+
+    Identity is bound to the pending stream's exact active-turn token
+    (``_transcript_user_row_is_pending_turn``), so a repeated prompt from a
+    different stream — even one submitted in the same integer second —
+    can never be matched against this pending turn and silently dropped.
+
+    Completion requires a genuine final visible assistant answer
+    (``_pending_turn_has_final_assistant_answer``): empty, tool-call-only,
+    interim ``_partial``, journal-recovered and compaction tails all keep
+    recovery active, because that is precisely the interrupted-turn shape
+    the recovery path exists for.
+
+    The transcript heuristic alone is not durable: an unflagged interim
+    prose row ("Let me check the logs first.") followed by tool rows that
+    were never followed by a final answer in the transcript passes the
+    predicate as a "completed" turn, but the stream may have died mid-
+    tool and the run journal was never marked done. 9/23 re-gate: also
+    require durable same-stream terminal evidence. The run journal
+    cannot supply that evidence on this path — the caller in
+    ``_apply_core_sync_or_error_marker`` already returns early whenever
+    the run journal reports ``completed`` for the stream, so the branch
+    that reaches this predicate can never observe that state (which is
+    why the previous run-journal gate was unreachable dead code). The
+    evidence therefore has to come from the turn journal, which records
+    the exact-stream ``completed`` event for the pending turn
+    (``_turn_journal_records_completion``). Without it, fall through to
+    the normal journal-recovery path so the partial output is replayed
+    and the interruption is marked.
+
+    The suppression is therefore deliberately conservative: whenever the
+    turn's identity, its completion, or its durable terminal evidence
+    cannot be positively proven, this helper returns False and the
+    prompt is recovered instead of discarded. A false negative leaves a
+    visible cosmetic duplicate; a false positive silently destroys a
+    prompt or a response.
+
+    Idempotent: this is a pure read that does not mutate the session.
+    Running recovery twice therefore produces the same outcome.
+    """
+    pending_text = getattr(session, 'pending_user_message', None)
+    if not pending_text:
+        return False
+    messages = getattr(session, 'messages', None)
+    if not isinstance(messages, list):
+        return False
+    pending_token = _pending_active_turn_token(session)
+    for idx, message in enumerate(messages):
+        if not _transcript_user_row_is_pending_turn(message, session, pending_token):
+            continue
+        # Found the pending turn's own user row at ``idx``. A genuine
+        # final answer inside that turn's boundary is necessary but not
+        # sufficient: durable same-stream terminal evidence must also
+        # exist, otherwise unflagged interim prose
+        # ("Let me check the logs first.") followed by tool rows can be
+        # mistaken for a finished turn.
+        if not _pending_turn_has_final_assistant_answer(messages, idx):
+            continue
+        stream_id = getattr(session, 'active_stream_id', None)
+        # The turn journal — not the run journal — carries the
+        # completion evidence that is still observable here: the caller
+        # (``_apply_core_sync_or_error_marker``) already consumed the
+        # run-journal ``completed`` state on its own early return, so a
+        # run-journal gate at this depth can never fire.
+        if not _turn_journal_records_completion(session, stream_id):
+            # No durable same-stream terminal evidence — the turn may
+            # have died mid-tool. Fall through to the journal-recovery
+            # path instead of suppressing it.
+            return False
+        return True
+    return False
+
+
 def _partial_message_signature(message: dict) -> tuple:
     """Return a stable identity for partial assistant markers recovered on load."""
     if not isinstance(message, dict):
@@ -2543,6 +2882,54 @@ def _run_journal_terminal_state(session, stream_id: str | None) -> str | None:
     ):
         return None
     return str(terminal.get('terminal_state') or '') or None
+
+
+def _turn_journal_records_completion(session, stream_id: str | None) -> bool:
+    """Return True when the crash-safe turn journal proves the turn for
+    ``stream_id`` reached its terminal ``completed`` state.
+
+    The turn journal is written per stream/turn id by the exact-stream
+    workers and by :mod:`api.routes` on submission, so a ``completed``
+    event for the *pending stream id* is completion evidence that
+    survives a run-journal write failure: the run journal only reaches
+    ``done`` / ``stream_end`` on its own write path, and a process that
+    dies between the turn journal write and the run-journal terminal
+    append leaves the run journal without terminal state while the turn
+    journal still records that the turn actually finished.
+
+    Bound strictly to ``stream_id`` — a ``completed`` turn belonging to
+    another stream of the same session never settles this one — and to
+    the latest turn recorded for that stream, so a turn that was
+    cancelled or crashed (``interrupted``) keeps recovery active even
+    when an earlier turn of the same stream completed normally.
+    """
+    if not stream_id:
+        return False
+    try:
+        from api.turn_journal import (
+            derive_turn_journal_states,
+            read_turn_journal,
+        )
+        journal = read_turn_journal(session.session_id)
+        states, _ = derive_turn_journal_states(journal.get('events') or [])
+    except Exception:
+        return False
+    latest: tuple[float, str, dict] | None = None
+    for turn_id, event in states.items():
+        if str(event.get('stream_id') or '') != str(stream_id):
+            continue
+        try:
+            created_at = float(event.get('created_at') or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        # ``>=`` on both elements keeps the winner deterministic when two
+        # turns of the same stream share a ``created_at``.
+        candidate = (created_at, turn_id, event)
+        if latest is None or candidate[:2] >= latest[:2]:
+            latest = candidate
+    if latest is None:
+        return False
+    return latest[2].get('event') == 'completed'
 
 
 def _recoverable_unsaved_gateway_terminal_error(
@@ -3421,6 +3808,29 @@ def _apply_core_sync_or_error_marker(
             )
             return True
         if not _tail_user_already_checkpointed:
+            # #6366 re-gate: when the durable transcript has already
+            # advanced past this pending turn into a newer settled
+            # user/assistant boundary, the recovery path must NOT
+            # append a recovered user row + ``_partial`` clone +
+            # journal replay + generic no-response error after the
+            # valid final answer. The tail-only check above misses
+            # that case (the tail is a newer assistant row that can
+            # never match the pending user checkpoint). Clear only
+            # the stale pending fields and return; the transcript is
+            # already correct and durable.
+            if _transcript_already_advanced_past_pending(session):
+                session.active_stream_id = None
+                session.pending_user_message = None
+                session.pending_attachments = []
+                session.pending_started_at = None
+                session.pending_user_source = None
+                session.save(touch_updated_at=touch_updated_at)
+                logger.info(
+                    "Session %s: cleared stale pending state for stream %s — transcript already advanced past this turn",
+                    sid,
+                    _stream_id,
+                )
+                return True
             _append_recovered_pending_turn(session, timestamp=_recovered_ts)
         else:
             recovered = {
@@ -4141,6 +4551,57 @@ def _sidecar_stat_signature(path):
             int(st.st_size), int(getattr(st, 'st_ctime_ns', int(st.st_ctime * 1_000_000_000))))
 
 
+_MESSAGE_COUNT_MARKER = 1
+
+
+def _prefix_message_count(path):
+    """The sidecar's own persisted ``message_count``, from a bounded prefix.
+
+    The #1558 shrink check in save() needs exactly one integer -- how many
+    messages the file on disk holds -- and the writer puts that integer in the
+    metadata prefix, before ``messages``, precisely so readers can have it
+    without parsing the body (see METADATA_FIELDS). Reading the prefix costs
+    O(64 KiB) against O(file size) for ``read_text`` + ``json.loads`` (measured
+    2026-09-15: 20,377 ms for one integer on a 203,439,398-byte sidecar).
+
+    Content-derived on purpose. A stat identity cannot stand in for it: an
+    in-place rewrite of the same length inside one mtime tick keeps inode, size
+    *and* mtime_ns, so a cached count would read a real shrink as a growth and
+    skip the backup. The count is part of the bytes, so any rewrite of them
+    rewrites it too.
+
+    Gated on the writer marker (``_mc_v``, review 2026-09-22): a count is only
+    trusted when the SAME write that produced the messages array also vouched
+    for the count. Anything unmarked -- a legacy pre-#5854 sidecar, a sidecar
+    materialized by an older recovery writer whose denormalized count could be
+    stale against its rows, any foreign writer -- returns None and the caller
+    falls back to the full read + parse. After one save by the current writer
+    the file carries the marker and the fast path resumes.
+
+    Returns None -- meaning "the caller must fall back to the full read +
+    parse" -- for every shape that does not carry a usable MARKED count: an
+    unmarked or wrong-marker file, a legacy sidecar whose count is not in the
+    prefix, a file with no top-level ``messages`` key at all, a corrupt or
+    truncated prefix, an unreadable path, or metadata alone that overflows the
+    budget.
+    """
+    try:
+        raw = _read_metadata_json_prefix(path)
+    except (OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get('_mc_v') != _MESSAGE_COUNT_MARKER:
+        return None
+    return _parse_nonnegative_int(parsed.get('message_count'))
+
+
 def _legacy_sidecar_facts_get(sid):
     """Return cached authoritative facts for a LEGACY sidecar, or None (#5854).
 
@@ -4690,7 +5151,41 @@ class _FullSessionResolveRequired(RuntimeError):
     """Internal signal that a full sidecar load must enter the bounded path."""
 
 
-_FULL_SESSION_RESOLVE_MAX_CONCURRENT = 2
+def _read_max_session_resolve_concurrent() -> int:
+    """#7421: env override for the heavy session-resolve cap. The
+    hardcoded literal 2 is too low for high-concurrency
+    deployments where several parallel active sessions all need
+    a full-transcript resolve; operators can set
+    ``HERMES_WEBUI_MAX_SESSION_RESOLVE`` to a positive int to
+    raise the cap without code changes. A bad or missing value
+    falls back to the previous default of 2, so an operator who
+    sets ``HERMES_WEBUI_MAX_SESSION_RESOLVE=0`` or a non-numeric
+    value does not regress to a blocked or unbounded state.
+
+    The cap is a *safety bound* (per-resolve cost tracked in
+    #7310), not a user preference — a typo like ``=999999``
+    must fall back to the safe default, never to the permissive
+    extreme. Every other bad input in this function falls back
+    to ``2``; out-of-range values do too. The previously
+    accepted upper bound (64) is reachable only via an explicit
+    in-range operator value; a profile's ``.env`` cannot reach
+    it at all (see ``_PROTECTED_ENV_KEYS``).
+    """
+    raw = (os.getenv("HERMES_WEBUI_MAX_SESSION_RESOLVE") or "").strip()
+    if not raw:
+        return 2
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 2
+    if n < 1:
+        return 2
+    if n > 64:
+        return 2  # #7656 round-3: typo-safe fallback, not clamp-up-to-64
+    return n
+
+
+_FULL_SESSION_RESOLVE_MAX_CONCURRENT = _read_max_session_resolve_concurrent()
 _FULL_SESSION_RESOLVE_SLOTS = threading.BoundedSemaphore(
     _FULL_SESSION_RESOLVE_MAX_CONCURRENT
 )
@@ -5071,7 +5566,7 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
     wt = worktree_info if isinstance(worktree_info, dict) else None
     workspace_path = (wt.get('path') if wt and wt.get('path') else workspace) if wt else workspace
     s = Session(
-        workspace=workspace_path or get_last_workspace(),
+        workspace=workspace_path or get_last_workspace(profile=profile),
         model=effective_model,
         model_provider=effective_model_provider,
         profile=profile,
@@ -5736,6 +6231,7 @@ def get_session_for_file_ops(sid: str):
         workspace, recovered = resolve_implicit_workspace_with_recovery(
             stored_workspace,
             get_last_workspace,
+            profile=session_profile or None,
         )
     except ValueError:
         # Preserve the existing file-handler behavior for non-missing trust or
@@ -6278,7 +6774,12 @@ def _diag_stage(diag, name: str) -> None:
             pass
 
 
-def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
+def all_sessions(
+    diag=None,
+    *,
+    include_lineage_metadata: bool = True,
+    sidebar_metadata_only: bool = False,
+):
     _diag_stage(diag, "all_sessions.active_streams")
     active_stream_ids = _active_stream_ids()
     # Phase C: try index first for O(1) read; fall back to full scan
@@ -6318,7 +6819,7 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
                     _diag_stage(diag, "all_sessions.backfill_load")
                     full = Session.load(s.get('session_id'))
                     if full:
-                        index[i] = full.compact()
+                        index[i] = full.compact(sidebar_metadata_only=sidebar_metadata_only)
                         backfilled.append(full)
             if backfilled:
                 try:
@@ -6340,6 +6841,7 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
                     index_map[s.session_id] = s.compact(
                         include_runtime=True,
                         active_stream_ids=active_stream_ids,
+                        sidebar_metadata_only=sidebar_metadata_only,
                     )
             missing_persisted_ids = []
             if persisted_ids is not None:
@@ -6372,6 +6874,7 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
                     index_map[sidecar.session_id] = sidecar.compact(
                         include_runtime=True,
                         active_stream_ids=active_stream_ids,
+                        sidebar_metadata_only=sidebar_metadata_only,
                     )
                     recovered_sidecars.append(sidecar)
                 if recovered_sidecars:
@@ -6429,6 +6932,9 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
             for s in result:
                 if not s.get('profile'):
                     s['profile'] = 'default'
+            if sidebar_metadata_only:
+                for s in result:
+                    _strip_sidebar_heavy_metadata(s)
             return result
         except Exception:
             logger.debug("Failed to load session index, falling back to full scan")
@@ -6459,7 +6965,11 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
     # Hide empty Untitled sessions from the UI entirely — kept consistent with the
     # index-path filter above. No grace window: a 0-message Untitled session is
     # never shown regardless of age (#1171).  Same streaming exemption as above (#1327).
-    result = [s.compact(include_runtime=True, active_stream_ids=active_stream_ids) for s in out if not (
+    result = [s.compact(
+        include_runtime=True,
+        active_stream_ids=active_stream_ids,
+        sidebar_metadata_only=sidebar_metadata_only,
+    ) for s in out if not (
         s.title == 'Untitled'
         and len(s.messages) == 0
         and not s.active_stream_id
@@ -6482,6 +6992,9 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
     for s in result:
         if not s.get('profile'):
             s['profile'] = 'default'
+    if sidebar_metadata_only:
+        for s in result:
+            _strip_sidebar_heavy_metadata(s)
     return result
 
 
@@ -6600,7 +7113,7 @@ CRON_PROJECT_NAME = 'Cron Jobs'
 _CRON_PROJECT_LOCK = threading.Lock()
 
 
-def ensure_cron_project(create: bool = True) -> str | None:
+def ensure_cron_project(create: bool = True, profile: str | None = None) -> str | None:
     """Return the project_id of the system "Cron Jobs" project for the active profile.
 
     Each profile gets its own "Cron Jobs" project so cron-spawned sessions in
@@ -6622,7 +7135,10 @@ def ensure_cron_project(create: bool = True) -> str | None:
     """
     from api.profiles import get_active_profile_name, _is_root_profile
 
-    active = get_active_profile_name() or 'default'
+    # `profile` is the owner of the state.db being projected; the active
+    # profile is only a fallback so a cross-profile scan never tags another
+    # profile's system project onto the one currently selected.
+    active = profile or get_active_profile_name() or 'default'
     with _CRON_PROJECT_LOCK:
         projects = load_projects()
         # Look for an existing per-profile cron project. Match either an exact
@@ -6662,11 +7178,12 @@ WEBHOOK_PROJECT_NAME = 'Webhooks'
 _WEBHOOK_PROJECT_LOCK = threading.Lock()
 
 
-def ensure_webhook_project() -> str:
-    """Return the project_id of the system "Webhooks" project for the active profile."""
+def ensure_webhook_project(profile: str | None = None) -> str:
+    """Return the project_id of the system "Webhooks" project for `profile` (default: active)."""
     from api.profiles import get_active_profile_name, _is_root_profile
 
-    active = get_active_profile_name() or 'default'
+    # Owner of the scanned state.db wins over the selected profile (see ensure_cron_project).
+    active = profile or get_active_profile_name() or 'default'
     with _WEBHOOK_PROJECT_LOCK:
         projects = load_projects()
         for p in projects:
@@ -6694,7 +7211,7 @@ def ensure_webhook_project() -> str:
         return project_id
 
 
-def _profile_has_user_projects() -> bool:
+def _profile_has_user_projects(profile: str | None = None) -> bool:
     """True if the active profile already has at least one real (non-system) project.
 
     "Opted into project organization" means `load_projects()` contains a
@@ -6707,7 +7224,7 @@ def _profile_has_user_projects() -> bool:
     """
     from api.profiles import get_active_profile_name, _is_root_profile
 
-    active = get_active_profile_name() or 'default'
+    active = profile or get_active_profile_name() or 'default'
     reserved = {CRON_PROJECT_NAME, WEBHOOK_PROJECT_NAME}
     for p in load_projects():
         if p.get('name') in reserved:
@@ -6753,7 +7270,7 @@ def import_cli_session(
     s = Session(
         session_id=session_id,
         title=title,
-        workspace=get_last_workspace(),
+        workspace=get_last_workspace(profile=profile),
         model=model,
         messages=messages,
         profile=profile,
@@ -7596,6 +8113,7 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
     return dict(metadata)
 
 
+@profile_home_resolve_cache_scope()
 def _load_cli_sessions_uncached(
     hermes_home: Path,
     db_path: Path,
@@ -7634,7 +8152,9 @@ def _load_cli_sessions_uncached(
     def _cron_pid():
         if not _cron_pid_cache[0]:
             _cron_pid_cache[0] = True
-            _cron_pid_cache[1] = ensure_cron_project(create=_profile_has_user_projects())
+            _cron_pid_cache[1] = ensure_cron_project(
+                create=_profile_has_user_projects(_cli_profile), profile=_cli_profile,
+            )
         return _cron_pid_cache[1]
 
     # Memoize the cron jobs.json job_id -> name map for this scan. The two row
@@ -7676,13 +8196,16 @@ def _load_cli_sessions_uncached(
     _cli_workspace_cache: list = [None]  # list-as-cell; None = not yet resolved
     def _cli_workspace():
         if _cli_workspace_cache[0] is None:
-            _cli_workspace_cache[0] = str(get_last_workspace())
+            try:
+                _cli_workspace_cache[0] = str(get_last_workspace(profile=_cli_profile))
+            except TypeError:
+                _cli_workspace_cache[0] = str(get_last_workspace())
         return _cli_workspace_cache[0]
 
     _webhook_pid_cache: list[str | None] = [None]
     def _webhook_pid():
         if _webhook_pid_cache[0] is None:
-            _webhook_pid_cache[0] = ensure_webhook_project()
+            _webhook_pid_cache[0] = ensure_webhook_project(profile=_cli_profile)
         return _webhook_pid_cache[0]
 
     def _state_row_project_id(sid: str, source: str | None) -> str | None:
@@ -7890,7 +8413,7 @@ def _load_cli_sessions_uncached(
                 cli_sessions.append({
                     'session_id': sid,
                     'title': _display_title,
-                    'workspace': str(get_last_workspace()),
+                    'workspace': _cli_workspace(),
                     'model': row['model'] or None,
                     'message_count': row['message_count'] or row['actual_message_count'] or 0,
                     'created_at': row['started_at'],
@@ -8178,18 +8701,138 @@ def _state_db_active_rows_digest(rows) -> str:
     return digest.hexdigest() if stamped else ''
 
 
+# hermes_state stores list/dict message content (multimodal parts) as a
+# sentinel-prefixed JSON string because sqlite3 binds only scalars; see
+# hermes_state._CONTENT_JSON_PREFIX and _decode_content(). This module reads
+# that table with its own SQL, so it must apply the same decode. Without it an
+# image part's base64 data URI reaches the transcript as literal text -- a
+# single unbreakable ~65k-character run -- and WebKit computes min-content
+# width by scanning every line-break position, pinning a core for minutes.
+#
+# The decode deliberately does NOT widen `content` beyond the one shape the
+# rest of the WebUI already accepts:
+#   * list roots only. A dict root would reach _getCachedRender() unchanged and
+#     _renderCacheKey() would call text.slice() on an object, blanking the turn.
+#   * no non-finite numbers. Python emits NaN/Infinity, which the browser's
+#     JSON.parse() rejects, breaking the whole /api/session response.
+# Anything else is returned as the original string, exactly as before.
+_STATE_DB_CONTENT_JSON_PREFIX = "\x00json:"
+
+
+def _is_valid_image_part_payload(part) -> bool:
+    """Explicit per-type payload validation for an image content part."""
+    part_type = part.get("type")
+    if part_type in ("image_url", "input_image"):
+        ref = part.get("image_url")
+        if isinstance(ref, dict):
+            ref = ref.get("url")
+        if isinstance(ref, str) and ref.strip():
+            return True
+        file_id = part.get("file_id")
+        return part_type == "input_image" and isinstance(file_id, str) and bool(file_id.strip())
+    if part_type == "image":
+        source = part.get("source")
+        if not isinstance(source, dict):
+            return False
+        if source.get("type") == "base64":
+            data = source.get("data")
+            return (
+                isinstance(data, str)
+                and bool(data)
+                and isinstance(source.get("media_type"), str)
+            )
+        if source.get("type") == "url":
+            url = source.get("url")
+            return isinstance(url, str) and bool(url.strip())
+        return False
+    return False
+
+
+def _is_supported_content_part_list(parts) -> bool:
+    """True only for lists the current WebUI will actually render.
+
+    The shared JS readers keep text parts and discard every image part:
+    ``msgContent()`` joins the text parts and trims, and ``_messageIsRenderable()``
+    hides the row when that is empty. This projection supplies no attachments,
+    so image parts do not render from it either. A list is therefore decoded only
+    when it carries non-whitespace text to show. Image-only lists, and lists with
+    a malformed image part, stay undecoded so the row cannot silently vanish.
+    """
+    if not parts:
+        return False
+    has_text = False
+    for part in parts:
+        if not isinstance(part, dict):
+            return False
+        part_type = part.get("type")
+        if not isinstance(part_type, str):
+            return False
+        if part_type == "text":
+            text = part.get("text")
+            if not isinstance(text, str):
+                return False
+            if text.strip():
+                has_text = True
+        elif part_type in _SESSION_MESSAGE_IMAGE_PART_TYPES:
+            if not _is_valid_image_part_payload(part):
+                return False
+        else:
+            return False
+    return has_text
+
+
+def _reject_non_finite_state_db_json_constant(value):
+    raise ValueError(f"unsupported JSON constant: {value}")
+
+
+def _parse_finite_state_db_json_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"unsupported JSON float: {value}")
+    return parsed
+
+
+def _decode_state_db_content(value):
+    """Decode the Agent's structured-content storage form without widening it.
+
+    Returns the original value unchanged for anything that is not a
+    sentinel-prefixed, finite, list-rooted payload.
+    """
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if not isinstance(value, str) or not value.startswith(_STATE_DB_CONTENT_JSON_PREFIX):
+        return value
+    try:
+        decoded = json.loads(
+            value[len(_STATE_DB_CONTENT_JSON_PREFIX):],
+            parse_constant=_reject_non_finite_state_db_json_constant,
+            parse_float=_parse_finite_state_db_json_float,
+        )
+    except Exception:
+        return value
+    if not isinstance(decoded, list) or not _is_supported_content_part_list(decoded):
+        return value
+    try:
+        # Prove the decoded value survives the trip to the browser before
+        # handing it on: re-serialisable, finite, UTF-8 encodable.
+        json.dumps(decoded, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except Exception:
+        return value
+    return decoded
+
+
 def _project_state_db_message(row, available, id_col, optional):
     """Authoritative state.db row → WebUI message projection (#6826 r4).
 
     Shared by ``get_state_db_session_messages`` and the regeneration
     single-snapshot helper so the bounded tail can never drift from the
-    canonical reader: JSON-decode tool_calls/reasoning payloads, omit
+    canonical reader: JSON-decode content/tool_calls/reasoning payloads, omit
     empty fields, keep durable row id private (``_state_db_row_id`` only for
     real Agent api_content replays), and apply ``tool_name → name``.
     """
     msg = {
         'role': row['role'],
-        'content': row['content'],
+        'content': _decode_state_db_content(row['content']),
         'timestamp': row['timestamp'],
     }
     for col in optional:
@@ -8339,9 +8982,26 @@ def get_state_db_session_messages(
                 cur.execute("PRAGMA table_info(sessions)")
                 session_cols = {str(row['name']) for row in cur.fetchall()}
                 if {'parent_session_id', 'end_reason', 'started_at', 'source'}.issubset(session_cols):
+                    # session_source/model_config carry the fork/delegate boundary
+                    # identity consumed by _is_continuation_session (#6931/#7021).
+                    # Select them when present so the branch-marker guard applies
+                    # to the stitch path too; older schemas degrade to NULL.
+                    identity_cols = []
+                    if 'session_source' in session_cols:
+                        identity_cols.append('session_source')
+                    else:
+                        identity_cols.append('NULL AS session_source')
+                    if 'model_config' in session_cols:
+                        identity_cols.append('model_config')
+                    else:
+                        identity_cols.append('NULL AS model_config')
+                    lineage_select = (
+                        "id, source, started_at, parent_session_id, ended_at, end_reason"
+                        + ", " + ", ".join(identity_cols)
+                    )
                     cur.execute(
-                        """
-                        SELECT id, source, started_at, parent_session_id, ended_at, end_reason
+                        f"""
+                        SELECT {lineage_select}
                         FROM sessions
                         WHERE id = ?
                         """,
@@ -8359,8 +9019,8 @@ def get_state_db_session_messages(
                             if not parent_id or parent_id in seen:
                                 break
                             cur.execute(
-                                """
-                                SELECT id, source, started_at, parent_session_id, ended_at, end_reason
+                                f"""
+                                SELECT {lineage_select}
                                 FROM sessions
                                 WHERE id = ?
                                 """,
@@ -8592,7 +9252,11 @@ def get_state_db_session_message_keys_before_timestamp(
                 _session_message_visible_key(
                     {
                         "role": row["role"],
-                        "content": row["content"],
+                        # Same guarded decode as the projected tail: prefix and
+                        # tail keys must share one representation or the
+                        # prefix/tail collision proof can miss a genuine
+                        # repeated recovered turn.
+                        "content": _decode_state_db_content(row["content"]),
                         "tool_calls": _json_loads_if_string(row["tool_calls"]),
                         "api_content": row["api_content"] if "api_content" in available else None,
                     },
@@ -8700,7 +9364,7 @@ def get_state_db_regeneration_tail_snapshot(
             prefix_keys = [
                 _session_message_visible_key({
                     "role": r["role"],
-                    "content": r["content"],
+                    "content": _decode_state_db_content(r["content"]),
                     "tool_calls": _json_loads_if_string(r["tool_calls"]) if "tool_calls" in r.keys() and r["tool_calls"] is not None else None,
                     "api_content": r["api_content"] if "api_content" in r.keys() else None,
                 }, normalize_workspace_prefix=True)
@@ -8887,14 +9551,27 @@ def _session_message_multimodal_mirror_key(
     msg: dict,
     *,
     require_image_parts: bool = False,
+    require_scalar_mirror: bool = False,
 ):
-    """Return exact cross-store identity for a native multimodal mirror."""
+    """Return exact cross-store identity for a native multimodal mirror.
+
+    The bridge exists to pair ONE rich image-bearing row with ONE scalar row
+    holding the Agent's stored projection of it. It must never pair two rich
+    rows: distinct image turns can project to the same "[screenshot] <text>"
+    string, so rich-to-rich matching collapses different images into one turn.
+    Callers pass ``require_image_parts`` on the rich side and
+    ``require_scalar_mirror`` on the scalar side to keep the pairing asymmetric.
+    """
     if not isinstance(msg, dict):
+        return None
+    if require_image_parts and require_scalar_mirror:
         return None
     role = str(msg.get("role") or "").strip().lower()
     if role != "user":
         return None
     raw_content = msg.get("content")
+    if require_scalar_mirror and not isinstance(raw_content, str):
+        return None
     content = _agent_durable_multimodal_content(msg)
     if require_image_parts and content is None:
         return None
@@ -8920,6 +9597,53 @@ def _session_message_multimodal_mirror_key(
     )
 
 
+# Per-call memo of structured-content identities. Reconciliation derives merge,
+# dedup, content and visible keys for every message, several per source, so a
+# large multimodal payload would otherwise be serialised once per key. The memo
+# is scoped to a single merge call (set/reset in
+# merge_session_messages_append_only) and keyed by object identity with the
+# object held alive, so a later call always recomputes after mutation and an id
+# can never be reused for a different list within one call.
+_STRUCTURED_IDENTITY_MEMO = contextvars.ContextVar(
+    "_STRUCTURED_IDENTITY_MEMO", default=None
+)
+
+
+def _canonical_structured_content(content) -> str:
+    """Canonical serialisation of structured content -- the expensive step."""
+    try:
+        return json.dumps(content, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        return repr(content)
+
+
+def _content_identity_for_key(content):
+    """Identity component for message content in every reconciliation key.
+
+    Non-list values key exactly as they always have: ``str(content or "")``.
+
+    Non-empty list content -- which reaches these paths once the state.db
+    sentinel is decoded -- gets an OUT-OF-BAND identity: a tuple, not a string.
+    No scalar can ever compare equal to it, so there is no in-band marker for a
+    message body to imitate. (An earlier revision tagged lists with a string
+    prefix; a scalar containing that prefix collided with the rich row.)
+
+    Merge, dedup, content and visible keys all derive structured content
+    through this one function so the discriminator cannot drift between them.
+    """
+    if not (isinstance(content, list) and content):
+        return str(content or "")
+    memo = _STRUCTURED_IDENTITY_MEMO.get()
+    if memo is not None:
+        hit = memo.get(id(content))
+        if hit is not None and hit[0] is content:
+            return hit[1]
+    identity = ("structured_content", _canonical_structured_content(content))
+    if memo is not None:
+        memo[id(content)] = (content, identity)
+    return identity
+
+
 def _session_message_merge_key(msg: dict):
     if not isinstance(msg, dict):
         return ("non_dict", repr(msg))
@@ -8939,7 +9663,7 @@ def _session_message_merge_key(msg: dict):
     return _session_message_key_with_sidecar((
         "legacy",
         str(msg.get("role") or ""),
-        str(msg.get("content") or ""),
+        _content_identity_for_key(msg.get("content")),
         _normalized_message_timestamp_for_key(msg.get("timestamp")),
         str(msg.get("tool_call_id") or ""),
         str(msg.get("tool_name") or msg.get("name") or ""),
@@ -9190,7 +9914,9 @@ def _copy_api_content_sidecar(target: dict | None, source: dict | None) -> bool:
         )
         if (
             target_mirror_key is None
-            or target_mirror_key != _session_message_multimodal_mirror_key(source)
+            or target_mirror_key != _session_message_multimodal_mirror_key(
+                source, require_scalar_mirror=True
+            )
         ):
             return False
     if target.get("api_content") not in (None, ""):
@@ -9630,7 +10356,7 @@ def _session_message_dedup_key(msg: dict):
     return _session_message_key_with_sidecar((
         "legacy",
         str(msg.get("role") or ""),
-        str(msg.get("content") or ""),
+        _content_identity_for_key(msg.get("content")),
         str(msg.get("timestamp") or ""),
         str(msg.get("tool_call_id") or ""),
         str(msg.get("tool_name") or msg.get("name") or ""),
@@ -9638,10 +10364,19 @@ def _session_message_dedup_key(msg: dict):
     ), msg)
 
 
-def _normalized_session_message_content(msg: dict) -> str:
+def _normalized_session_message_content(msg: dict):
+    """Visible identity for a message's content.
+
+    Scalars normalise whitespace as before. Structured content returns the same
+    out-of-band tuple as the merge/dedup keys, so content and visible keys can
+    never place a list and a string in the same identity space.
+    """
     if not isinstance(msg, dict):
         return repr(msg)
-    return " ".join(str(msg.get("content") or "").split())
+    content = msg.get("content")
+    if isinstance(content, list) and content:
+        return _content_identity_for_key(content)
+    return " ".join(str(content or "").split())
 
 
 def _loose_session_message_content(value: str) -> str:
@@ -9657,7 +10392,7 @@ def _session_message_content_key(
         return ("non_dict", repr(msg))
     role = str(msg.get("role") or "")
     content = _normalized_session_message_content(msg)
-    if role == "user" and normalize_workspace_prefix:
+    if role == "user" and normalize_workspace_prefix and isinstance(content, str):
         # WebUI sends the model a workspace-prefixed user_message
         # ("[Workspace::v1: /path]\n<text>") while the visible/optimistic
         # bubble and the WebUI sidecar row carry only the bare "<text>". The
@@ -9700,7 +10435,7 @@ def _session_message_visible_key(
     _tc_key = json.dumps(_tc, sort_keys=True, default=str) if _tc else ""
     role = str(msg.get("role") or "")
     content = _normalized_session_message_content(msg)
-    if role == "user" and normalize_workspace_prefix:
+    if role == "user" and normalize_workspace_prefix and isinstance(content, str):
         # state.db stores the model-facing workspace-prefixed prompt while the
         # WebUI sidecar owns the bare visible text. Fold that protocol wrapper
         # into the exact key so large-session reconciliation does not depend on
@@ -9725,7 +10460,9 @@ def _build_visible_duplicate_lookup(visible_keys: set[tuple]) -> dict:
             content = key[1]
         except (TypeError, IndexError):
             continue
-        if not content:
+        # Only text identities take part in fuzzy matching; structured content
+        # is exact-identity only and must never fuzzy-match a scalar.
+        if not content or not isinstance(content, str):
             continue
         by_role.setdefault(role, []).append(key)
     # Keep loose_by_key lazy.  Some transcripts contain multi-megabyte tool
@@ -9745,6 +10482,11 @@ def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], lo
     sidecar = visible_key[3] if len(visible_key) > 3 else None
     if not content:
         return None
+    # Structured content is matched by exact identity only (checked above).
+    # Substring/token matching would otherwise compare a canonical list
+    # serialisation against arbitrary text and pair a rich row with a scalar.
+    if not isinstance(content, str):
+        return None
     # Exact identity above remains authoritative at every size. The fallback
     # below scans the existing keys for every candidate, so it becomes
     # quadratic on long transcripts even when each individual message is small.
@@ -9759,7 +10501,12 @@ def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], lo
         existing_role = existing_key[0]
         existing_content = existing_key[1] if len(existing_key) > 1 else ""
         existing_sidecar = existing_key[3] if len(existing_key) > 3 else None
-        if role != existing_role or sidecar != existing_sidecar or not existing_content:
+        if (
+            role != existing_role
+            or sidecar != existing_sidecar
+            or not existing_content
+            or not isinstance(existing_content, str)
+        ):
             continue
         # Exact visible-key equality was checked above. For very large payloads
         # (tool logs / request dumps), Python-in substring and fuzzy-token
@@ -10053,16 +10800,22 @@ def _insert_state_message_chronologically(messages: list, msg: dict) -> bool:
             # preceding assistant's tool_calls, not just the first — a multi-tool
             # turn has several adjacent tool results, and inserting between any of
             # them splits the block (assistant, tool, <insert>, tool).
-            if (
-                idx < len(messages)
-                and messages[idx].get("role") == "tool"
-                and idx > 0
-                and messages[idx - 1].get("role") == "assistant"
-                and messages[idx - 1].get("tool_calls")
-            ):
-                while idx < len(messages) and messages[idx].get("role") == "tool":
-                    idx += 1
-                    advanced = True
+            if idx < len(messages) and messages[idx].get("role") == "tool":
+                # Walk back over any contiguous tool rows already emitted for
+                # this block, so the owning assistant is found even when idx
+                # lands on the SECOND result of a multi-tool turn (where
+                # messages[idx - 1] is another tool row, not the assistant).
+                owner = idx - 1
+                while owner >= 0 and messages[owner].get("role") == "tool":
+                    owner -= 1
+                if (
+                    owner >= 0
+                    and messages[owner].get("role") == "assistant"
+                    and messages[owner].get("tool_calls")
+                ):
+                    while idx < len(messages) and messages[idx].get("role") == "tool":
+                        idx += 1
+                        advanced = True
             # (b) Skip past an equal-timestamp run whose left neighbour shares
             # this message's role — inserting there would re-order an
             # already-matched same-role turn (user, <inserted user>, assistant).
@@ -10091,6 +10844,33 @@ def merge_session_messages_append_only(
     *,
     truncation_watermark=None,
     truncation_boundary=None,
+    incoming_provenance: Literal["unverified", "state_db"] = "unverified",
+) -> list:
+    """Merge sidecar/context and state.db messages without deleting local rows.
+
+    Thin wrapper that scopes the structured-content identity memo to this one
+    call; see :func:`_merge_session_messages_append_only_impl` for the merge.
+    """
+    token = _STRUCTURED_IDENTITY_MEMO.set({})
+    try:
+        return _merge_session_messages_append_only_impl(
+            sidecar_messages,
+            state_messages,
+            truncation_watermark=truncation_watermark,
+            truncation_boundary=truncation_boundary,
+            incoming_provenance=incoming_provenance,
+        )
+    finally:
+        _STRUCTURED_IDENTITY_MEMO.reset(token)
+
+
+def _merge_session_messages_append_only_impl(
+    sidecar_messages: list,
+    state_messages: list,
+    *,
+    truncation_watermark=None,
+    truncation_boundary=None,
+    incoming_provenance=None,
 ) -> list:
     """Merge sidecar/context and state.db messages without deleting local rows.
 
@@ -10184,7 +10964,16 @@ def merge_session_messages_append_only(
                 value = helper(msg)
                 # If this is a legacy message key, keep the already-stringified
                 # content payload for downstream helper calls.
-                if isinstance(value, tuple) and value and value[0] == "legacy":
+                # Structured content is never substituted: its key component is
+                # an identity token, not content, and writing it back would let
+                # a scalar equal to that token impersonate the rich row.
+                if (
+                    isinstance(value, tuple)
+                    and value
+                    and value[0] == "legacy"
+                    and isinstance(value[2], str)
+                    and not isinstance(msg.get("content"), list)
+                ):
                     prepared_msg = dict(msg)
                     prepared_msg["content"] = value[2]
                     _cached_msg_prepared[msg_cache_key] = prepared_msg
@@ -10199,13 +10988,20 @@ def merge_session_messages_append_only(
             prepared_msg = _cached_msg_prepared.get(msg_cache_key)
             if prepared_msg is None:
                 prepared_msg = dict(msg)
-                prepared_msg["content"] = (
-                    merge_key[2]
-                    if isinstance(merge_key, tuple)
+                raw_content = msg.get("content")
+                if isinstance(raw_content, list):
+                    # Keep the real structure; downstream keys derive their own
+                    # out-of-band identity from it.
+                    prepared_msg["content"] = raw_content
+                elif (
+                    isinstance(merge_key, tuple)
                     and len(merge_key) > 2
                     and merge_key[0] == "legacy"
-                    else str(msg.get("content") or "")
-                )
+                    and isinstance(merge_key[2], str)
+                ):
+                    prepared_msg["content"] = merge_key[2]
+                else:
+                    prepared_msg["content"] = str(raw_content or "")
                 _cached_msg_prepared[msg_cache_key] = prepared_msg
 
         value = helper(prepared_msg)
@@ -10348,7 +11144,9 @@ def merge_session_messages_append_only(
     if sidecar_multimodal_mirrors:
         state_multimodal_mirror_identities = {}
         for state_message in state_messages:
-            mirror_key = _session_message_multimodal_mirror_key(state_message)
+            mirror_key = _session_message_multimodal_mirror_key(
+                state_message, require_scalar_mirror=True
+            )
             state_multimodal_mirror_keys[id(state_message)] = mirror_key
             if (
                 mirror_key is not None
@@ -10667,7 +11465,21 @@ def merge_session_messages_append_only(
         seen_dedup_keys.add(dedup_key)
         seen_content_keys.add(content_key)
         seen_visible_keys.add(visible_key)
-        merged_messages.append(msg)
+        # This terminal path is shared by state.db reconciliation and by ordered
+        # sidecar stitching (notably compression continuations). Only the caller
+        # that read state.db may authorize timestamp-based recovery placement;
+        # stable child-sidecar sequence remains authoritative even when an
+        # archived parent was restamped later.
+        if (
+            incoming_provenance == "state_db"
+            and max_sidecar_timestamp is not None
+            and timestamp is not None
+            and timestamp < max_sidecar_timestamp
+        ):
+            if not _insert_state_message_chronologically(merged_messages, msg):
+                merged_messages.append(msg)
+        else:
+            merged_messages.append(msg)
         _remember_merged_message(msg, source="state")
     return merged_messages
 
@@ -10787,6 +11599,7 @@ def reconciled_state_db_messages_for_session(
         state_messages,
         truncation_watermark=getattr(session, "truncation_watermark", None),
         truncation_boundary=getattr(session, "truncation_boundary", None),
+        incoming_provenance="state_db",
     )
     return _state_db_session_messages_result(
         reconciled_messages,

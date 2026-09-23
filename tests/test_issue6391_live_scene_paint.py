@@ -41,7 +41,11 @@ for(end++; depth && end < src.length; end++) {
         if(source[end]==='{') depth++;
         if(source[end]==='}') depth--;
       }
-      return source.slice(start,end);
+      // _wireSSE now binds upstream's idle-recovery callbacks. Execute that
+      // real dependency in the same lexical fixture scope, not a no-op stub.
+      const dependencies=name==='_wireSSE'
+        ?extract(source,'_bindSidebarIdleRecovery')+'\n':'';
+      return dependencies+source.slice(start,end);
     }
     const messageSource=fs.readFileSync(process.argv[2], 'utf8');
 let _pendingTerminalFinish=null,_terminalFadeTimer=null,_terminalFadeFrame=null;
