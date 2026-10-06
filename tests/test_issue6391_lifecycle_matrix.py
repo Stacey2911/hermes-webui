@@ -69,7 +69,8 @@ assert.equal(_anchorPaintDisposedForTest(),false);
 
 
 @pytest.mark.parametrize("mode", ["compact_worklog", "transparent_stream"])
-def test_done_fade_then_stream_end_completes_once_before_late_callbacks(mode):
+@pytest.mark.parametrize("tail", ["stream_end", "error", "apperror", "cancel"])
+def test_done_fade_terminal_tail_respects_completion_owner(mode, tail):
     run_js(
         r"""
 let _anchorPaintGeneration=0,_anchorPaintDisposed=false;
@@ -120,15 +121,21 @@ assert.equal(_terminalStateReached,true);
 assert.ok(_pendingTerminalFinish,'done must leave a required finish pending during the fade');
 assert.equal(terminalClaims,0);
 assert.equal(typeof fadeFinish,'function');
-source.dispatch('stream_end',{});
-assert.equal(terminalClaims,1,'stream_end must complete the pending terminal exactly once');
-assert.equal(_pendingTerminalFinish,null);
+source.dispatch(TAIL,{});
+assert.ok(closed>0,'terminal tail closes transport');
+if(TAIL==='stream_end'||TAIL==='error'){
+ assert.equal(terminalClaims,0,'transport tail must not cut the fade');
+ assert.ok(_pendingTerminalFinish);
+}else{
+ assert.equal(terminalClaims,1,'application error and cancel settle immediately');
+ assert.equal(_pendingTerminalFinish,null);
+}
 fadeFinish();
 for(const type of ['done','token','reasoning','tool','tool_complete','cancel','error','apperror','stream_end']){
   source.dispatch(type,{text:'late',status:'error'});
 }
 assert.equal(terminalClaims,1,'late producers and terminal signals cannot reclaim completion');
-""".replace("MODE", repr(mode))
+""".replace("MODE", repr(mode)).replace("TAIL", repr(tail))
     )
 
 

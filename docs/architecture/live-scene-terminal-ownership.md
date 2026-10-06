@@ -23,9 +23,12 @@ The normalized-event replay API preserves its already-normalized provenance.
 
 ## Semantic and visual ownership
 
-Producer receipt appends token text synchronously. An independent 32 ms semantic
-batch extracts prose/inline thinking and synchronizes inflight messages; every
+Producer receipt consumes only the new token delta into incremental semantic
+state. An independent 32 ms publication batch synchronizes prose and inflight messages; every
 non-token event and owner detach drains pending prose before its boundary.
+Outside XML/DSML context, literal adjacent `<` characters (including intervening
+whitespace) publish the resolved literal prefix and retain only the last opener
+as lookahead. Genuine unfinished markup remains parser-owned and fail-closed.
 Reasoning and tool callbacks then ingest their state in receipt order. Normal
 frame paints and terminal fade steps only project existing state; they must not
 upsert semantic prose as a consequence of painting.
@@ -33,8 +36,11 @@ upsert semantic prose as a consequence of painting.
 The stream closure owns the live scene scheduler, generation, pending terminal
 completion, fade timeout/frame, snapshot/persistence timers and registry cleanup.
 A valid `done` schedules one generation-bound completion. The completion is
-claimed and removed before invocation. A transport close during optional fade
-must complete that pending semantic work before disposing the owner.
+claimed and removed before invocation. `stream_end` and EventSource transport
+`error` close the source without forcing a pending done-fade to finish. The
+generation-bound fade retains completion ownership. Sidebar idle reconciliation
+recognizes that pending semantic owner even when its transport is closed.
+Application `apperror` and `cancel` retain immediate completion semantics.
 
 Once terminal state is claimed, later live producer events cannot compete with
 it. Already-dispatched callbacks must check the current generation and, where
@@ -54,6 +60,10 @@ retains the existing journal-replay recovery contract.
 Each recovery rewire re-registers the exact registry and re-arms its backstop.
 Registry removal is conditional on exact registry identity so disposal cannot
 remove a replacement owner's entry. Disposal is idempotent.
+The ten-minute backstop renews one cleanup timer while the exact live owner
+still holds the registry; it does not expire an active stream. Ownership loss
+allows expiry, and explicit terminal disposal cancels the timer and releases
+the registry and owner reference immediately.
 
 ## Incremental projection
 
@@ -67,6 +77,10 @@ private live path from explicit public materialization.
 Initial construction still uses the full projection. The renderer also retains
 its explicit terminal-row fail-closed branch; terminal settlement is not a
 steady-state paint. Genuine identity/order uncertainty continues to rebuild.
+Incremental row replacement captures disclosure and detail scroll state from
+the identity-matched old row, mounts updated content, then restores presentation
+state with the existing disclosure helpers. It does not retain the old node as
+presentation owner. This applies in Compact Worklog and Transparent Stream.
 
 ## Projection-cache lifetime
 

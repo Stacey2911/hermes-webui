@@ -12,7 +12,7 @@ const _rememberRunJournalCursor=()=>{throw new Error('late cursor callback');};
 eval(extract(messageSource,'_withDeferredAnchorScenePaint'));
 eval(extract(messageSource,'_wireSSE'));
 const listeners=[];
-const source={addEventListener(type,fn){listeners.push({type,fn});}};
+const source={readyState:1,close(){if(this.readyState!==2)closed++;this.readyState=2;},addEventListener(type,fn){listeners.push({type,fn});}};
 _wireSSE(source);
 for(const type of ['token','reasoning','interim_assistant','tool','tool_complete','done']){
  for(const c of listeners.filter(c=>c.type===type))c.fn({data:'invalid JSON'});
@@ -20,7 +20,9 @@ for(const type of ['token','reasoning','interim_assistant','tool','tool_complete
 assert.equal(finished,0);
 _pendingTerminalFinish={generation:0,finish:()=>{}};
 for(const c of listeners.filter(c=>c.type==='error'))c.fn({data:'invalid JSON'});
-assert.equal(finished,1);assert.equal(closed,1);
+assert.equal(finished,0);assert.equal(closed,1);
+assert.ok(_pendingTerminalFinish,'network error leaves semantic finish to the fade');
+_completeOwnedTerminal();assert.equal(finished,1);
 """)
 
 
